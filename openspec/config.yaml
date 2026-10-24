@@ -1,0 +1,28 @@
+schema: spec-driven
+
+context: |
+  Platform: agent 记忆共享
+  Language: Chinese (中文)
+  All artifacts (proposals, specs, design, tasks, and other documentation) must be written entirely in Chinese. 所有生成的文档（提案、规格、任务、设计文档等）必须全部使用中文撰写。
+  Repository shape: one workspace for cross-agent memory and context sharing.
+  Domain: agent memory, shared context, session handoff, knowledge reuse
+  Conventions:
+    - All generated documents must be written in Chinese (所有生成的文档必须全部使用中文撰写).
+    - Specs describe behavior and capabilities, not file layout.
+    - Capability names use kebab-case and should be stable over time.
+    - Keep proposals concise and focused on one feature, fix, or capability change.
+
+rules:
+  proposal:
+    - 必须全部使用中文撰写。
+    - 说明为什么现在要做这个变更。
+    - 区分新增能力与修改能力。
+  specs:
+    - 必须全部使用中文撰写。
+    - 使用需求/场景语言，聚焦外部可见行为。
+    - 只写真正发生变化的能力。
+  design:
+    - 必须全部使用中文撰写。
+  tasks:
+    - 必须全部使用中文撰写。
+    - 每个复选框都能独立实现和验证。

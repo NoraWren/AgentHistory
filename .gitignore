@@ -1,0 +1,9 @@
+.build/
+dist/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+
+# 本地截图含个人会话内容，不随仓库发布
+docs/screenshots/

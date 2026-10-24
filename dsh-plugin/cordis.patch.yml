@@ -1,0 +1,9 @@
+- insert:
+    - id: mcp-agent-history
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: agent-history
+        transport: stdio
+        command: /Users/kongqi/Applications/AgentHistory.app/Contents/MacOS/AgentHistory
+        args:
+          - mcp

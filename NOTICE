@@ -1,0 +1,5 @@
+AgentHistory（Agent 记忆）
+Copyright 2026 Kong Qi
+
+This product depends only on system frameworks (Foundation, AppKit, SwiftUI,
+libsqlite3). It bundles no third-party libraries.
