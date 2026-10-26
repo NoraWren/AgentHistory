@@ -15,6 +15,27 @@ enum DBError: Error, CustomStringConvertible {
     }
 }
 
+/// 判断一条数据库错误属于哪类故障，供界面翻译成人话。
+/// sqlite 的提示语在不同语言与版本下不一致，所以以错误码为主、文本为辅。
+extension DBError {
+    var isLocked: Bool {
+        let lower = description.lowercased()
+        if lower.contains("locked") || lower.contains("busy") { return true }
+        return false
+    }
+
+    var isUnreadable: Bool {
+        if isLocked { return false }
+        let lower = description.lowercased()
+        // 缺表、缺列这类结构问题要原样报出来，别混成权限问题。
+        if lower.contains("no such table") || lower.contains("no such column") { return false }
+        return lower.contains("unable to open")
+            || lower.contains("cannot open")
+            || lower.contains("authorization denied")
+            || lower.contains("not a database")
+    }
+}
+
 final class Database {
     private var handle: OpaquePointer?
     let path: String

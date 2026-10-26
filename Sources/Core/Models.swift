@@ -55,6 +55,11 @@ struct ThreadRow: Identifiable {
     let itemCount: Int
     let threadSource: String
     let archived: Bool
+    /// 同族里除自己以外的会话数，0 表示没有副本。
+    var copyCount: Int = 0
+    var familyId: String? = nil
+    /// original / copy / 空字符串（未归族）。
+    var lineageRole: String = ""
 }
 
 struct ItemRow: Identifiable {
@@ -66,6 +71,8 @@ struct ItemRow: Identifiable {
     let createdAt: Int64
     let text: String
     let truncated: Bool
+    /// 所属轮次在本会话里的序号，0 表示没归到任何一轮。
+    var turnOrdinal: Int = 0
 }
 
 struct ItemInput {
@@ -77,6 +84,9 @@ struct ItemInput {
     let text: String
     let rawJSON: String
     var truncated: Bool = false
+    /// 来源原生的轮次标识。Codex 直接取投影库的 turn_id，其余来源由适配器给出；
+    /// 留空表示这条接在会话已有的最后一轮后面。
+    var turnId: String? = nil
 }
 
 struct ThreadInput {
@@ -101,6 +111,50 @@ struct SearchHit: Identifiable {
     let createdAt: Int64
     let text: String
     let ordinal: Int
+    /// 命中条目实际所在的会话。合并视角下它可能是副本。
+    var hitThreadId: String? = nil
+    var copyCount: Int = 0
+    var groupHits: Int = 1
+    /// 短语命中 / 宽松命中
+    var matchKind: String = "短语"
+
+    var targetThreadId: String { hitThreadId ?? threadId }
+}
+
+struct SearchOptions {
+    var sourceKind: SourceKind? = nil
+    var projectPath: String? = nil
+    var since: Int64? = nil
+    var until: Int64? = nil
+    var onlyUser: Bool = false
+    var limit: Int = 60
+    var mergeCopies: Bool = true
+}
+
+struct LineageMember: Identifiable {
+    let id: String
+    let title: String
+    let sourceKind: SourceKind
+    let nativeId: String
+    /// original 或 copy
+    let role: String
+    /// confirmed（同步记录）或 inferred（按内容推断）
+    let relation: String
+    let direction: String
+    let targetRef: String
+    let createdAt: Int64
+    let itemCount: Int
+
+    var isRepresentative: Bool { role == "original" }
+    var relationLabel: String { relation == "confirmed" ? "同步记录" : "按内容推断" }
+}
+
+struct LineageInfo {
+    let familyId: String
+    let members: [LineageMember]
+
+    var representative: LineageMember? { members.first(where: { $0.isRepresentative }) ?? members.first }
+    var copies: [LineageMember] { members.filter { !$0.isRepresentative } }
 }
 
 struct SyncPhase {

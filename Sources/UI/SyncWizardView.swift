@@ -14,6 +14,22 @@ final class WizardModel: ObservableObject {
     @Published var cancelRequested = false
     @Published var finished = false
 
+    /// 写入线程会频繁查这个标志，用锁保护，避免后台直接读 @Published 造成数据竞争。
+    private let cancelLock = NSLock()
+    private var cancelFlag = false
+
+    private func requestCancel(_ on: Bool) {
+        cancelLock.lock(); cancelFlag = on; cancelLock.unlock()
+        DispatchQueue.main.async { self.cancelRequested = on }
+    }
+
+    private var isCancelRequested: Bool {
+        cancelLock.lock(); defer { cancelLock.unlock() }
+        return cancelFlag
+    }
+
+    func requestCancelPublic() { requestCancel(true) }
+
     init(store: Store) { self.store = store }
 
     func preview() {
@@ -46,7 +62,7 @@ final class WizardModel: ObservableObject {
     func execute() {
         guard let plan, !running else { return }
         running = true
-        cancelRequested = false
+        requestCancel(false)
         finished = false
         progress = 0
         phase = "准备"
@@ -57,7 +73,7 @@ final class WizardModel: ObservableObject {
             do {
                 let result = try TransferRunner(store: self.store).execute(
                     plan: plan,
-                    shouldCancel: { self.cancelRequested }
+                    shouldCancel: { [weak self] in self?.isCancelRequested ?? true }
                 ) { fraction, phase in
                     DispatchQueue.main.async {
                         self.progress = fraction
@@ -75,7 +91,11 @@ final class WizardModel: ObservableObject {
             } catch {
                 DispatchQueue.main.async {
                     self.running = false
-                    self.message = "执行失败：\(error)"
+                    // 取消不是异常，别让界面显示成一串 NSError。
+                    let reason = ClaudeWriter.describe(error)
+                    self.message = reason == "已取消" ? "已取消，已写入的内容都撤销了" : reason
+                    self.phase = reason == "已取消" ? "已取消" : "失败"
+                    self.finished = true
                 }
             }
         }
@@ -291,7 +311,7 @@ struct SyncWizardView: View {
     private var footer: some View {
         HStack(spacing: 10) {
             Button("取消") {
-                if wizard.running { wizard.cancelRequested = true } else { dismiss() }
+                if wizard.running { wizard.requestCancelPublic() } else { dismiss() }
             }
             Spacer()
             Button("预览") { wizard.preview() }

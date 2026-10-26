@@ -81,6 +81,71 @@ enum TextTools {
         flushRun(); flushWord()
         return parts.isEmpty ? "" : parts.joined(separator: " AND ")
     }
+
+    /// 与 makeMatchQuery 同源，但把连续汉字拆成单字后用 AND 连接，
+    /// 用于短语命中不足时的宽松补充。
+    static func makeLooseQuery(_ query: String) -> String {
+        var parts: [String] = []
+        var word = ""
+        func flushWord() {
+            if !word.isEmpty {
+                parts.append("\"" + word.replacingOccurrences(of: "\"", with: "\"\"") + "\"")
+                word = ""
+            }
+        }
+        for scalar in query.unicodeScalars {
+            if isCJK(scalar) {
+                flushWord()
+                parts.append("\"" + String(Character(scalar)) + "\"")
+            } else if isWordChar(scalar) {
+                word.unicodeScalars.append(scalar)
+            } else {
+                flushWord()
+            }
+        }
+        flushWord()
+        return parts.isEmpty ? "" : parts.joined(separator: " AND ")
+    }
+
+    /// 连续汉字保留为一个真正的 FTS5 短语（"表 格"），用于短语优先的第一段检索。
+    static func makePhraseQuery(_ query: String) -> String {
+        var parts: [String] = []
+        var run: [String] = []
+        var word = ""
+        func flushRun() {
+            if !run.isEmpty {
+                parts.append("\"" + run.joined(separator: " ") + "\"")
+                run = []
+            }
+        }
+        func flushWord() {
+            if !word.isEmpty {
+                parts.append("\"" + word.replacingOccurrences(of: "\"", with: "\"\"") + "\"")
+                word = ""
+            }
+        }
+        for scalar in query.unicodeScalars {
+            if isCJK(scalar) {
+                flushWord()
+                run.append(String(Character(scalar)))
+            } else if isWordChar(scalar) {
+                flushRun()
+                word.unicodeScalars.append(scalar)
+            } else {
+                flushRun(); flushWord()
+            }
+        }
+        flushRun(); flushWord()
+        return parts.isEmpty ? "" : parts.joined(separator: " AND ")
+    }
+
+    /// 去掉检索词里的 FTS5 语法字符，避免用户输入被当成表达式。
+    static func sanitize(_ query: String) -> String {
+        let stripped = query.unicodeScalars.filter { scalar in
+            !"\"*(){}[]^~:\\".unicodeScalars.contains(scalar)
+        }
+        return String(String.UnicodeScalarView(stripped)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 enum Redactor {

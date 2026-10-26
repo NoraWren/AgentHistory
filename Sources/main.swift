@@ -7,6 +7,13 @@ func makeStore() throws -> Store {
     try Store()
 }
 
+func fmtBytes(_ bytes: Int64) -> String {
+    ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+}
+
+/// 所有子命令都在这里执行，顶层统一把错误翻译成一句中文再退出，
+/// 避免路径没权限时抛 Swift fatal error 把调用方埋在一堆 domain code 里。
+func runMain() throws {
 switch command {
 case "ui", "--ui":
     runUI()
@@ -36,18 +43,310 @@ case "stats":
     }
 
 case "search":
-    let query = args.dropFirst().joined(separator: " ")
-    guard !query.isEmpty else { print("用法：AgentHistory search <关键词>"); exit(2) }
+    var options = SearchOptions()
+    options.limit = 60
+    var words: [String] = []
+    var i = 1
+    while i < args.count {
+        switch args[i] {
+        case "--source":
+            i += 1
+            // 写错来源时早先直接跳过，检索照旧跑全库，看起来「筛了但没筛住」。
+            if i < args.count, let kind = SourceKind(rawValue: args[i]) {
+                options.sourceKind = kind
+            } else if i < args.count {
+                let allowed = SourceKind.allCases.map(\.rawValue).joined(separator: " / ")
+                FileHandle.standardError.write(Data("--source \(args[i]) 不认识，只能用 \(allowed)\n".utf8))
+                exit(2)
+            } else {
+                FileHandle.standardError.write(Data("--source 后面要跟一个来源\n".utf8))
+                exit(2)
+            }
+        case "--project":
+            i += 1
+            if i < args.count { options.projectPath = args[i] }
+        case "--days":
+            i += 1
+            if i < args.count, let d = Int(args[i]) {
+                if d > 0 {
+                    options.since = Int64((Date().timeIntervalSince1970 - Double(d) * 86400) * 1000)
+                } else {
+                    FileHandle.standardError.write(Data("--days \(d) 不是正数，没法按天筛，按不限时间算\n".utf8))
+                }
+            } else {
+                FileHandle.standardError.write(Data("--days 后面要跟一个整数\n".utf8))
+            }
+        case "--limit":
+            i += 1
+            // 检索层会把 0 和负数夹到 1，这里提前说一声，别让人以为写了 0 就真返回 0 条。
+            if i < args.count, let n = Int(args[i]) {
+                if n > 0 {
+                    options.limit = n
+                } else {
+                    FileHandle.standardError.write(Data("--limit \(n) 不是正数，按 1 条算\n".utf8))
+                    options.limit = 1
+                }
+            } else {
+                FileHandle.standardError.write(Data("--limit 后面要跟一个整数\n".utf8))
+            }
+        case "--asked":
+            options.onlyUser = true
+        case "--all":
+            options.mergeCopies = false
+        default:
+            words.append(args[i])
+        }
+        i += 1
+    }
+    let query = words.joined(separator: " ")
+    guard !query.isEmpty else {
+        print("用法：AgentHistory search <关键词> [--source codex] [--project 路径] [--days 7] [--asked] [--all] [--limit 60]")
+        exit(2)
+    }
     let store = try makeStore()
-    let hits = try store.search(query)
+    let hits = try store.search(query, options: options)
     for hit in hits {
-        print("[\(hit.sourceKind.displayName)] \(hit.threadTitle)")
+        var marks: [String] = [hit.matchKind]
+        if hit.groupHits > 1 { marks.append("命中 \(hit.groupHits) 处") }
+        if hit.copyCount > 0 { marks.append("另有 \(hit.copyCount) 处副本") }
+        print("[\(hit.sourceKind.displayName)] \(hit.threadTitle)  （\(marks.joined(separator: "·"))）")
+        print("  thread_id=\(hit.threadId)（命中在 \(hit.targetThreadId)）")
         print("  \(hit.text.replacingOccurrences(of: "\n", with: " ").prefix(120))")
     }
     print("共 \(hits.count) 条")
 
+case "rebuild-lineage":
+    let store = try makeStore()
+    let report = try LineageBuilder.rebuild(store: store)
+    print(report.summary)
+    print("条目 \(report.itemsBefore) → \(report.itemsAfter)，检索索引 \(report.docsBefore) → \(report.docsAfter)")
+    for (reason, count) in report.skippedReasons.sorted(by: { $0.value > $1.value }) {
+        print("  跳过：\(reason) \(count) 条")
+    }
+    exit(report.itemsBefore == report.itemsAfter && report.docsBefore == report.docsAfter ? 0 : 1)
+
+case "lineage":
+    guard args.count >= 2 else { print("用法：AgentHistory lineage <会话ID>"); exit(2) }
+    let store = try makeStore()
+    guard let info = try store.lineage(threadId: args[1]) else {
+        print("这个会话没有副本"); exit(0)
+    }
+    for m in info.members {
+        let tag = m.isRepresentative ? "原创" : "副本"
+        print("\(tag)  [\(m.sourceKind.displayName)] \(m.title)")
+        print("   \(m.id)  \(m.relationLabel)  \(m.direction)  \(m.itemCount) 条")
+        if !m.targetRef.isEmpty { print("   目标内标识：\(m.targetRef)") }
+    }
+
+case "export":
+    var ids: [String] = []
+    var dir = Store.defaultRoot + "/exports"
+    var i = 1
+    while i < args.count {
+        if args[i] == "--out" {
+            i += 1
+            if i < args.count { dir = args[i] }
+        } else {
+            ids.append(args[i])
+        }
+        i += 1
+    }
+    let store = try makeStore()
+    if ids.isEmpty {
+        print("用法：AgentHistory export <会话ID>... [--out 目录]"); exit(2)
+    }
+    let report = Exporter.export(store: store, threadIds: ids, directory: dir)
+    print(report.summary)
+    for f in report.files { print("  \(f)") }
+    for f in report.failures { print("  失败：\(f.title) — \(f.reason)") }
+    exit(report.failed == 0 ? 0 : 1)
+
 case "mcp":
     runMCP()
+
+case "models":
+    // 换一台机器先看这个：装了什么、该填什么命令，不用猜。
+    let hits = LLMDetector.detect(force: true)
+    if hits.isEmpty {
+        print("没探测到模型命令行。可以装 Claude Code 或 Codex，也可以用 --api 直接接接口。")
+        print("接口需要：地址（到 /v1）、模型名，密钥可留空读环境变量。")
+    } else {
+        print("本机探测到 \(hits.count) 个：")
+        for hit in hits {
+            print("  \(hit.preset.label)")
+            print("    路径：\(hit.path)")
+            print("    命令：\(hit.preset.command)")
+            print("    说明：\(hit.preset.note)")
+        }
+    }
+    for name in LLMAPI.keyVariables {
+        let has = !(ProcessInfo.processInfo.environment[name] ?? "").isEmpty
+        print("环境变量 \(name)：\(has ? "已设置" : "没设置")")
+    }
+    // 界面上填过的接口配置，命令行这边也要看得见，省得靠记忆猜上次填了什么。
+    let saved = LLMSettings.load()
+    let savedBase = saved.base
+    let savedModel = saved.model
+    let savedKey = saved.apiKey
+    if savedBase.isEmpty, savedModel.isEmpty {
+        print("已存的接口配置：还没填过")
+    } else {
+        print("已存的接口配置：\(savedBase.isEmpty ? "（地址空）" : savedBase) · \(savedModel.isEmpty ? "（模型名空）" : savedModel) · 密钥\(savedKey.isEmpty ? "没存" : "已存")")
+    }
+
+case "digest-clean":
+    // 清掉汇编调用模型时被同步进来的假会话；只认工作目录，不动真实对话。
+    let store = try makeStore()
+    let removed = try store.purgeDigestScratch()
+    print(removed == 0 ? "库里没有汇编临时会话" : "库里清掉 \(removed) 个汇编临时会话")
+    // claude 不给会话持久化也会建空的项目目录，顺带扫一遍。
+    let swept = ScratchCleaner.clean()
+    for root in swept.roots { print("扫了 \(root)：\(swept.summary)") }
+    print(DigestWorkspace.purge(storeRoot: store.root).summary)
+    let cached = DigestCache.purge(storeRoot: store.root)
+    if cached.count > 0 {
+        print("清掉 \(cached.count) 份提炼缓存，腾出 "
+              + ByteCountFormatter.string(fromByteCount: cached.bytes, countStyle: .file))
+    } else {
+        print("没有提炼缓存")
+    }
+
+case "backups":
+    // 传输前的备份只增不减，本机到过 774 MB。default 是看用量，prune 按时间留最近几份。
+    let store = try makeStore()
+    let action = args.count > 1 ? args[1] : "show"
+    switch action {
+    case "prune":
+        let keep = args.count > 2 ? (Int(args[2]) ?? 5) : 5
+        guard keep >= 1 else {
+            print("要保留至少 1 份，收到 \(keep)")
+            exit(2)
+        }
+        let before = WriteSupport.backupUsage(storeRoot: store.root)
+        let result = WriteSupport.pruneBackups(storeRoot: store.root, keep: keep)
+        let after = WriteSupport.backupUsage(storeRoot: store.root)
+        if result.removed == 0 {
+            print("没有可清的：自动备份 \(before.prunable) 份，没超过保留的 \(keep) 份")
+            if before.manual > 0 {
+                print("另有 \(before.manual) 份手工断点没动；整个目录 \(before.count) 份、\(fmtBytes(before.bytes))")
+            }
+        } else {
+            print("清掉 \(result.removed) 份备份，腾出 \(fmtBytes(result.bytes))")
+            print("现在 \(after.count) 份、\(fmtBytes(after.bytes))")
+            if after.manual > 0 {
+                print("其中 \(after.manual) 份是手工断点，没动")
+            }
+        }
+    case "show", "":
+        let usage = WriteSupport.backupUsage(storeRoot: store.root)
+        print("\(usage.count) 份备份，共 \(fmtBytes(usage.bytes))")
+        print("目录：\(store.root)/backups")
+        if usage.manual > 0 {
+            print("其中 \(usage.manual) 份是手工断点（名字不是时间戳），prune 不会动，要删得自己删")
+        }
+        print("自动备份现有 \(usage.prunable) 份；只留最近 5 份：AgentHistory backups prune 5")
+    default:
+        print("用法：AgentHistory backups [show|prune 份数]")
+        exit(2)
+    }
+
+case "digest":
+    var options = DigestOptions()
+    var i = 1
+    var printOnly = false
+    while i < args.count {
+        switch args[i] {
+        case "--days":
+            i += 1
+            // 0 和负数当默认值处理，但要说一声：否则参数没生效，输出看起来跟没传一样。
+            if i < args.count, let d = Int(args[i]) {
+                if d > 0 {
+                    options.since = Int64((Date().timeIntervalSince1970 - Double(d) * 86400) * 1000)
+                } else {
+                    FileHandle.standardError.write(Data("--days \(d) 不是正数，按默认 7 天算\n".utf8))
+                }
+            } else {
+                FileHandle.standardError.write(Data("--days 后面要跟一个整数\n".utf8))
+            }
+        case "--source":
+            i += 1
+            if i < args.count, let kind = SourceKind(rawValue: args[i]) {
+                options.sourceKind = kind
+            } else if i < args.count {
+                let allowed = SourceKind.allCases.map(\.rawValue).joined(separator: " / ")
+                FileHandle.standardError.write(Data("--source \(args[i]) 不认识，只能用 \(allowed)\n".utf8))
+                exit(2)
+            } else {
+                FileHandle.standardError.write(Data("--source 后面要跟一个来源\n".utf8))
+                exit(2)
+            }
+        case "--project":
+            i += 1
+            if i < args.count { options.projectPath = args[i] }
+        case "--command":
+            i += 1
+            if i < args.count { options.command = args[i] }
+        case "--timeout":
+            i += 1
+            if i < args.count, let t = Double(args[i]) { options.timeout = t }
+        case "--parallel":
+            i += 1
+            if i < args.count, let n = Int(args[i]), n > 0 {
+                options.parallel = n
+            } else {
+                FileHandle.standardError.write(Data("--parallel 要是正整数，按默认 \(options.parallel) 路算\n".utf8))
+            }
+        case "--title":
+            i += 1
+            if i < args.count { options.title = args[i] }
+        case "--out":
+            i += 1
+            if i < args.count { options.outputDirectory = args[i] }
+        case "--no-llm":
+            options.useLLM = false
+        case "--no-cache":
+            options.useCache = false
+        case "--api":
+            // 不装任何 CLI 时用接口：--api https://api.openai.com/v1 gpt-4o-mini [密钥]
+            let rest = args.dropFirst(i + 1)
+            guard rest.count >= 2 else {
+                print("用法：--api <地址> <模型名> [密钥]"); exit(2)
+            }
+            let base = rest[rest.startIndex]
+            let name = rest[rest.startIndex + 1]
+            var key = ""
+            if rest.count >= 3, !rest[rest.startIndex + 2].hasPrefix("--") {
+                key = rest[rest.startIndex + 2]
+                i += 1
+            }
+            options.api = LLMAPI(baseURL: base, model: name, apiKey: key)
+            options.command = ""
+            i += 2
+        case "--print":
+            // 只把正文打到标准输出，便于管道接别的工具。
+            printOnly = true
+        default:
+            break
+        }
+        i += 1
+    }
+    let store = try makeStore()
+    let result = DigestRunner.run(store: store, options: options) { phase in
+        FileHandle.standardError.write(Data(("\r\(phase)          ").utf8))
+    }
+    FileHandle.standardError.write(Data("\n".utf8))
+    guard !result.isEmpty else {
+        print(result.note.isEmpty ? "没有可汇编的对话" : result.note)
+        exit(1)
+    }
+    if printOnly {
+        print(result.markdown)
+    } else {
+        print(result.markdown)
+        print("---")
+        print(result.note)
+        if !result.path.isEmpty { print("已保存：\(result.path)") }
+    }
 
 case "plan":
     guard args.count >= 3, let src = SourceKind(rawValue: args[1]), let dst = SourceKind(rawValue: args[2]) else {
@@ -98,10 +397,19 @@ case "repair-workbuddy":
     print("启动 WorkBuddy 后按项目查看；若仍未出现，先退出再重启一次")
 
 case "items":
-    guard args.count >= 2 else { print("用法：AgentHistory items <thread_id> [after_ordinal]"); exit(2) }
+    guard args.count >= 2 else { print("用法：AgentHistory items <thread_id> [after_ordinal|@ordinal]"); exit(2) }
     let store = try makeStore()
-    let after = args.count > 2 ? Int(args[2]) ?? -1 : -1
-    let rows = try store.items(threadId: args[1], afterOrdinal: after, limit: 200)
+    let rows: [ItemRow]
+    if args.count > 2, args[2].hasPrefix("@"), let at = Int(args[2].dropFirst()) {
+        if let position = try store.itemPosition(threadId: args[1], ordinal: at, itemId: nil) {
+            rows = try store.itemsPage(threadId: args[1], offset: position)
+        } else {
+            rows = []
+        }
+    } else {
+        let after = args.count > 2 ? Int(args[2]) ?? -1 : -1
+        rows = try store.items(threadId: args[1], afterOrdinal: after, limit: 200)
+    }
     for r in rows.prefix(5) {
         print("\(r.ordinal) [\(r.itemType)] \(r.text.prefix(60).replacingOccurrences(of: "\n", with: " "))")
     }
@@ -116,7 +424,26 @@ default:
       AgentHistory            打开界面
       AgentHistory sync       同步全部可用来源
       AgentHistory stats      查看统计
-      AgentHistory search     检索历史
+      AgentHistory search     检索历史（支持 --source/--project/--days/--asked/--all）
+      AgentHistory rebuild-lineage  重建副本血缘
+      AgentHistory lineage    查看某会话的副本
+      AgentHistory export     导出会话为 Markdown
       AgentHistory mcp        以 stdio MCP 运行
+      AgentHistory digest     按天汇编一段时间的对话（默认接 claude -p 提炼）
+                              --days 7 --source codex --project 路径 --no-llm
+                              --command "claude -p --no-session-persistence" --timeout 600 --parallel 5
+                              --api https://api.openai.com/v1 gpt-4o-mini [密钥]
+                              --out 目录 --title 标题 --print
+      AgentHistory models     看本机探测到哪些模型命令行，以及各自该用什么参数
+      AgentHistory digest-clean  清掉汇编调用模型时留下的临时会话和空的项目目录
+      AgentHistory backups    看传输前备份占了多少（prune [份数] 只留最近几份）
     """)
+}
+}
+
+do {
+    try runMain()
+} catch {
+    FileHandle.standardError.write(Data(("错误：" + ClaudeWriter.describe(error) + "\n").utf8))
+    exit(1)
 }

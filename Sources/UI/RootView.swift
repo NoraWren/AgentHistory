@@ -40,14 +40,24 @@ struct RootView: View {
             DetailView(model: model)
         }
         .toolbar {
-            ToolbarItem(placement: .automatic) {
+            // 用 primaryAction：.automatic 在这个窗口里会把第一个按钮折进溢出菜单，
+            // 「汇编」就点不到了。
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    model.showDigest = true
+                } label: {
+                    Label("汇编", systemImage: "text.append")
+                }
+                .help("把一段时间的对话汇编成结论")
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     model.showStatus = true
                 } label: {
                     Label("来源状态", systemImage: "gauge.medium")
                 }
             }
-            ToolbarItem(placement: .automatic) {
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     model.showSync = true
                 } label: {
@@ -61,6 +71,9 @@ struct RootView: View {
         }
         .sheet(isPresented: Binding(get: { model.showStatus }, set: { model.showStatus = $0 })) {
             SourceStatusView(model: model)
+        }
+        .sheet(isPresented: Binding(get: { model.showDigest }, set: { model.showDigest = $0 })) {
+            DigestView(model: model)
         }
         .onReceive(NotificationCenter.default.publisher(for: .focusSearch)) { _ in
             model.searchFocused = true
@@ -103,16 +116,24 @@ struct SidebarView: View {
                         ForEach(model.sources.filter { $0.available }) { src in
                             sourceRow(title: src.kind.displayName, count: src.threadCount,
                                       tint: Theme.source(src.kind), icon: Theme.sourceIcon(src.kind),
-                                      selected: model.filterSource == src.kind) {
+                                      selected: model.filterSource == src.kind,
+                                      warning: src.lastError) {
                                 model.filterSource = src.kind; model.reload()
                             }
                         }
                         ForEach(model.sources.filter { !$0.available }) { src in
-                            HStack(spacing: 8) {
-                                Circle().fill(Color.gray.opacity(0.4)).frame(width: 6, height: 6)
-                                Text(src.kind.displayName).font(.system(size: 11)).foregroundStyle(.tertiary)
+                            HStack(alignment: .top, spacing: 8) {
+                                Circle().fill(Color.gray.opacity(0.4)).frame(width: 6, height: 6).padding(.top, 4)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(src.kind.displayName).font(.system(size: 11)).foregroundStyle(.tertiary)
+                                    // 目录没装和装上却读不出来是两件事，别都写成「未安装」。
+                                    if let reason = src.lastError, !reason.contains("未找到"), !reason.isEmpty {
+                                        Text(reason).font(.system(size: 9)).foregroundStyle(.orange)
+                                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
                                 Spacer()
-                                Text("未安装").font(.system(size: 9)).foregroundStyle(.tertiary)
+                                Text(unavailableLabel(src.lastError)).font(.system(size: 9)).foregroundStyle(.tertiary)
                             }
                             .padding(.horizontal, 8)
                             .help(src.lastError ?? "数据目录不存在")
@@ -160,12 +181,28 @@ struct SidebarView: View {
         }
     }
 
+    /// 不可用来源右侧的短标签：目录不在叫「未安装」，装在但读不了叫「读取失败」。
+    private func unavailableLabel(_ reason: String?) -> String {
+        guard let reason else { return "未安装" }
+        if reason.contains("未找到") { return "未安装" }
+        if reason.contains("占用") { return "被占用" }
+        if reason.contains("zstd") { return "缺少解压工具" }
+        return "读取失败"
+    }
+
     private func sourceRow(title: String, count: Int, tint: Color, icon: String,
-                           selected: Bool, action: @escaping () -> Void) -> some View {
+                           selected: Bool, warning: String? = nil,
+                           action: @escaping () -> Void) -> some View {
         HStack(spacing: 8) {
             Image(systemName: icon).font(.system(size: 10)).foregroundStyle(tint).frame(width: 13)
             Text(title).font(.system(size: 11, weight: selected ? .semibold : .regular)).lineLimit(1)
             Spacer()
+            // 目录在、但上次同步失败：来源本身还列着，得给个提示，不然看不出它这次没同步上。
+            if let warning, !warning.isEmpty {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9)).foregroundStyle(.orange)
+                    .help(warning)
+            }
             Text("\(count)")
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(selected ? tint : Color.secondary)
@@ -205,13 +242,27 @@ struct ThreadListView: View {
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.subtle, lineWidth: 1))
             .padding(10)
 
+            filterBar
+
             if !model.searchHits.isEmpty {
                 HStack {
-                    Text("找到 \(model.searchHits.count) 条").font(.system(size: 9)).foregroundStyle(.secondary)
+                    Text("找到 \(model.searchHits.count) 个会话").font(.system(size: 9)).foregroundStyle(.secondary)
+                    if model.searchHits.contains(where: { $0.copyCount > 0 }) {
+                        Text("已合并副本").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    }
                     Spacer()
+                    Button("导出结果") { model.exportSearchResults() }
+                        .buttonStyle(.link).font(.system(size: 10))
                 }
                 .padding(.horizontal, 14)
                 .padding(.bottom, 4)
+            }
+
+            if let notice = model.jumpNotice {
+                Text(notice)
+                    .font(.system(size: 10)).foregroundStyle(.orange)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 4)
             }
 
             ScrollView {
@@ -240,12 +291,31 @@ struct ThreadListView: View {
                             .background(model.selectedThreadId == hit.threadId ? Theme.accentSoft : Color.clear,
                                         in: RoundedRectangle(cornerRadius: 8))
                             .padding(.horizontal, 6)
+                            .contextMenu {
+                                Button("导出此会话") { model.exportThreads([hit.threadId]) }
+                            }
                         }
                     } else {
                         ForEach(model.threads) { t in
                             ThreadRowView(thread: t, selected: model.selectedThreadId == t.id)
                                 .onTapGesture { model.select(t) }
                                 .padding(.horizontal, 6)
+                        }
+                        if !model.threadListExhausted {
+                            Button {
+                                model.loadMoreThreads()
+                            } label: {
+                                Text("加载更多（已显示 \(model.threads.count) / \(model.threadListTotal)）")
+                                    .font(.system(size: 10))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Theme.accent)
+                        } else if model.threads.count < model.threadListTotal {
+                            Text("只显示了 \(model.threads.count) 个")
+                                .font(.system(size: 10)).foregroundStyle(.tertiary)
+                                .padding(.top, 8)
                         }
                         if model.threads.isEmpty {
                             Text("没有符合条件的历史")
@@ -258,6 +328,35 @@ struct ThreadListView: View {
             }
         }
         .background(Color(nsColor: .underPageBackgroundColor).opacity(0.35))
+    }
+
+    private var filterBar: some View {
+        HStack(spacing: 6) {
+            Toggle(isOn: Binding(get: { model.mergeCopies },
+                                 set: { model.mergeCopies = $0; model.reload() })) {
+                Text("合并副本").font(.system(size: 10))
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            Divider().frame(height: 12)
+            Picker("时间", selection: Binding(get: { model.filterDays },
+                    set: { model.filterDays = $0; if !model.searchText.isEmpty { model.runSearch() } })) {
+                Text("全部").tag(0)
+                Text("7 天").tag(7)
+                Text("30 天").tag(30)
+                Text("90 天").tag(90)
+            }
+            .frame(maxWidth: 110)
+            Toggle(isOn: Binding(get: { model.onlyUser },
+                    set: { model.onlyUser = $0; if !model.searchText.isEmpty { model.runSearch() } })) {
+                Text("只看提问").font(.system(size: 10))
+            }
+            .toggleStyle(.checkbox)
+            .controlSize(.mini)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
     }
 }
 
@@ -273,6 +372,10 @@ struct ThreadRowView: View {
                 .multilineTextAlignment(.leading)
             HStack(spacing: 6) {
                 Pill(text: thread.sourceKind.displayName, color: Theme.source(thread.sourceKind))
+                if thread.copyCount > 0 {
+                    Text("另有 \(thread.copyCount) 处副本")
+                        .font(.system(size: 9)).foregroundStyle(.tertiary)
+                }
                 Text((thread.projectPath as NSString).lastPathComponent)
                     .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
@@ -313,7 +416,18 @@ struct DetailView: View {
                     Label((t.projectPath as NSString).lastPathComponent, systemImage: "folder")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     Text("\(t.itemCount) 条记录").font(.system(size: 10)).foregroundStyle(.tertiary)
+                    if !model.turns.isEmpty {
+                        turnPicker
+                    }
                     Spacer()
+                    Button {
+                        model.exportCurrent()
+                    } label: {
+                        Label("导出", systemImage: "square.and.arrow.down")
+                            .font(.system(size: 10))
+                    }
+                    .buttonStyle(.link)
+                    .help("导出为 Markdown")
                     if t.sourceKind == .codex {
                         Button {
                             if let url = URL(string: "codex://threads/\(t.nativeId)") { NSWorkspace.shared.open(url) }
@@ -323,6 +437,12 @@ struct DetailView: View {
                         }
                         .buttonStyle(.link)
                     }
+                }
+                if let lineage = try? model.store.lineage(threadId: t.id), lineage.members.count > 1 {
+                    lineageSection(lineage, current: t)
+                }
+                if let notice = model.jumpNotice {
+                    Text(notice).font(.system(size: 10)).foregroundStyle(.orange)
                 }
             }
             .padding(.horizontal, 18)
@@ -335,9 +455,17 @@ struct DetailView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                        ForEach(model.items) { item in
+                        ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
+                            // 轮次变了就插一条分隔，长会话里能一眼看出问到第几轮。
+                            if item.turnOrdinal > 0,
+                               index == 0 || model.items[index - 1].turnOrdinal != item.turnOrdinal {
+                                turnDivider(item.turnOrdinal)
+                            }
                             MessageBubble(item: item, highlighted: model.highlightItemId == item.id)
                                 .id(item.id)
+                                .contextMenu {
+                                    Button("复制完整正文") { model.copyItem(item) }
+                                }
                                 .onAppear {
                                     if item.id == model.items.last?.id { model.loadMore() }
                                 }
@@ -346,11 +474,98 @@ struct DetailView: View {
                     .padding(.horizontal, 18)
                     .padding(.vertical, 16)
                 }
-                .onChange(of: model.highlightItemId) { _, newValue in
-                    guard let id = newValue else { return }
-                    withAnimation { proxy.scrollTo(id, anchor: .center) }
+                // LazyVStack 里目标条目往往还没渲染，一次 scrollTo 经常落空。
+                // 连滚几拍，等条目进入布局后再滚也能滚到位。
+                // 依赖里带上 jumpToken：连着点同一轮时 id 没变，光看 id 不会重新滚。
+                .task(id: "\(model.selectedThreadId ?? "")#\(model.jumpToken)") {
+                    try? await Task.sleep(nanoseconds: 40_000_000)
+                    guard !Task.isCancelled else { return }
+                    if let id = model.highlightItemId {
+                        for attempt in 0..<8 {
+                            if attempt > 0 {
+                                try? await Task.sleep(nanoseconds: 70_000_000)
+                            }
+                            guard !Task.isCancelled else { return }
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                    } else if let first = model.items.first?.id {
+                        // 换了会话就从顶上开始，别停在上一份对话的滚动位置。
+                        proxy.scrollTo(first, anchor: .top)
+                    }
                 }
             }
+        }
+    }
+
+    private func turnDivider(_ ordinal: Int) -> some View {
+        turnDivider(ordinal, prompt: model.turns.first { $0.ordinal == ordinal }?.prompt ?? "")
+    }
+
+    private func turnDivider(_ ordinal: Int, prompt: String) -> some View {
+        HStack(spacing: 8) {
+            Rectangle().fill(Color.secondary.opacity(0.18)).frame(height: 1)
+            Text("第 \(ordinal) 轮")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.secondary)
+                .fixedSize()
+            if !prompt.isEmpty {
+                Text(prompt.replacingOccurrences(of: "\n", with: " "))
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 260, alignment: .leading)
+            }
+            Rectangle().fill(Color.secondary.opacity(0.18)).frame(height: 1)
+        }
+        .padding(.top, 4)
+    }
+
+    /// 轮次跳转。几十上百轮的会话靠滚动找某一轮不现实，直接从表头跳。
+    private var turnPicker: some View {
+        Menu {
+            ForEach(model.turns) { turn in
+                Button {
+                    model.jumpToTurn(turn.ordinal)
+                } label: {
+                    Text(model.currentTurn == turn.ordinal ? "✓ " + turnLabel(turn) : turnLabel(turn))
+                }
+            }
+        } label: {
+            Label("共 \(model.turns.count) 轮", systemImage: "list.number")
+                .font(.system(size: 10))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(model.currentTurn > 0 ? "当前在第 \(model.currentTurn) 轮，点开可跳转" : "点开跳到某一轮")
+    }
+
+    private func turnLabel(_ turn: Store.TurnRow) -> String {
+        let prompt = turn.prompt.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let head = prompt.count > 34 ? String(prompt.prefix(34)) + "…" : prompt
+        return head.isEmpty ? "第 \(turn.ordinal) 轮 · \(turn.itemCount) 条" : "第 \(turn.ordinal) 轮 · \(head)"
+    }
+
+    private func lineageSection(_ lineage: LineageInfo, current: ThreadRow) -> some View {
+        HStack(spacing: 8) {
+            Label("内容族 \(lineage.members.count) 个成员", systemImage: "square.stack.3d.up")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            ForEach(lineage.members.filter { $0.id != current.id }) { m in
+                Button {
+                    model.select(nil)
+                    if let t = model.threads.first(where: { $0.id == m.id }) {
+                        model.select(t)
+                    } else if let t = try? model.store.thread(id: m.id) {
+                        model.select(t)
+                    }
+                } label: {
+                    Text("\(m.sourceKind.displayName)\(m.role == "copy" ? " 副本" : " 原创会话")")
+                        .font(.system(size: 9))
+                }
+                .buttonStyle(.link)
+                .help("\(m.relationLabel)，目标标识 \(m.nativeId)")
+            }
+            Spacer()
         }
     }
 }
@@ -377,7 +592,14 @@ struct MessageBubble: View {
                         .font(.system(size: 9))
                         .foregroundStyle(isUser ? Color.white.opacity(0.65) : Color.secondary.opacity(0.6))
                 }
-                if isTool || isReasoning {
+                if isTool || isReasoning, highlighted {
+                    // 命中的是折叠的工具调用或思考时，直接摊开正文，不让用户再点一次。
+                    Text(item.text)
+                        .font(.system(size: 11, design: isTool ? .monospaced : .default))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(12)
+                } else if isTool || isReasoning {
                     DisclosureGroup {
                         Text(item.text)
                             .font(.system(size: 11, design: isTool ? .monospaced : .default))
@@ -539,6 +761,11 @@ struct StatusBarView: View {
             } else {
                 Circle().fill(Color.green).frame(width: 6, height: 6)
                 Text(model.statusText).font(.system(size: 10)).foregroundStyle(.secondary)
+                if let report = model.lastExport {
+                    Text("· 导出：\(report.written) 个文件").font(.system(size: 10)).foregroundStyle(.tertiary)
+                    Button("在访达中显示") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: report.directory) }
+                        .buttonStyle(.link).font(.system(size: 10))
+                }
                 Text("· 今日 \(model.stats.todayItems)").font(.system(size: 10)).foregroundStyle(.tertiary)
                 Spacer()
                 Button("立即同步") { model.runSync() }.buttonStyle(.link).font(.system(size: 10))

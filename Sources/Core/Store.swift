@@ -57,12 +57,69 @@ final class Store {
             todos TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'draft', payload TEXT NOT NULL DEFAULT '');
         CREATE VIRTUAL TABLE IF NOT EXISTS search_docs USING fts5(seg, content='', contentless_delete=1);
+        CREATE TABLE IF NOT EXISTS thread_families(
+            id TEXT PRIMARY KEY, representative_thread_id TEXT NOT NULL,
+            member_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS thread_links(
+            family_id TEXT NOT NULL, thread_id TEXT NOT NULL PRIMARY KEY,
+            role TEXT NOT NULL DEFAULT 'copy', relation TEXT NOT NULL DEFAULT 'inferred',
+            direction TEXT NOT NULL DEFAULT '', target_ref TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_threads_source ON threads(source_id, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread_id, ordinal);
+        -- 按轮取数（汇编、轮次摘要）走这两个索引，否则每轮都要把 items 全表扫一遍。
+        CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns(thread_id, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_turns_started ON turns(started_at);
+        CREATE INDEX IF NOT EXISTS idx_items_turn ON items(turn_id, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_items_turn_type ON items(turn_id, item_type);
         CREATE INDEX IF NOT EXISTS idx_handoffs_thread ON handoffs(thread_id);
+        CREATE INDEX IF NOT EXISTS idx_links_thread ON thread_links(thread_id);
+        CREATE INDEX IF NOT EXISTS idx_links_family ON thread_links(family_id);
+        CREATE INDEX IF NOT EXISTS idx_families_rep ON thread_families(representative_thread_id);
         """)
-        try db.run("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','1')")
+        try db.run("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','2')")
+        try backfillTurns()
+    }
+
+    /// 老库里条目没有轮次归属（`turns` 为空、`items.turn_id` 全空），
+    /// 靠一次重建把它们按「一条用户消息带其后所有回复」切回轮次。
+    /// 之后各来源同步会带原生轮次标识，这里只跑一次，结果记在 meta 里。
+    private func backfillTurns() throws {
+        let done = try db.query("SELECT value FROM meta WHERE key='turns_backfill'") { $0.text(0) }.first
+        guard done != "1" else { return }
+        let threads = try db.query("""
+        SELECT DISTINCT i.thread_id FROM items i
+        WHERE i.turn_id IS NULL AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.thread_id=i.thread_id)
+        """) { $0.text(0) }
+        for threadId in threads {
+            let rows = try db.query("""
+            SELECT rowid,item_type,created_at FROM items WHERE thread_id=? ORDER BY ordinal
+            """, [threadId]) { ($0.int64(0), $0.text(1), $0.int64(2)) }
+            guard !rows.isEmpty else { continue }
+            try db.transaction {
+                var ordinal = 0
+                var currentTurn: String? = nil
+                for (rowid, type, created) in rows {
+                    if currentTurn == nil || type == "userMessage" {
+                        ordinal += 1
+                        let id = UUID().uuidString
+                        try db.run("""
+                        INSERT INTO turns(id,thread_id,native_turn_id,ordinal,status,started_at,completed_at)
+                        VALUES(?,?,?,?,'completed',?,?)
+                        """, [id, threadId, "legacy-\(ordinal)", ordinal, created, created])
+                        currentTurn = id
+                    }
+                    guard let turn = currentTurn else { continue }
+                    try db.run("UPDATE items SET turn_id=? WHERE rowid=?", [turn, rowid])
+                    try db.run("""
+                    UPDATE turns SET started_at=MIN(started_at,CASE WHEN ?>0 THEN ? ELSE started_at END),
+                        completed_at=MAX(completed_at,?) WHERE id=?
+                    """, [created, created, created, turn])
+                }
+            }
+        }
+        try db.run("INSERT OR REPLACE INTO meta(key,value) VALUES('turns_backfill','1')")
     }
 
     // MARK: - 来源
@@ -138,23 +195,45 @@ final class Store {
         return id
     }
 
+    /// 写入条目，同时把条目归到轮次上。
+    ///
+    /// 轮次标识的优先级：条目自带的 `turnId` > 调用方给的 `turnNativeId` > 会话已有最后一轮。
+    /// 来源没给轮次时（比如老数据、或增量里只有助手回复），接在最后一轮后面，
+    /// 这样按轮折叠时不会出现一堆孤立的半轮。
+    @discardableResult
     func upsertItems(threadId: String, items: [ItemInput], turnNativeId: String? = nil) throws -> (inserted: Int, redacted: Int) {
         var inserted = 0
         var redacted = 0
-        var turnId: String? = nil
-        if let turnNativeId, !turnNativeId.isEmpty {
-            let rows = try db.query("SELECT id FROM turns WHERE thread_id=? AND native_turn_id=?",
-                                    [threadId, turnNativeId]) { $0.text(0) }
-            if let id = rows.first { turnId = id }
-            else {
-                let id = UUID().uuidString
+        var turnCache: [String: String] = [:]
+        var lastNativeTurn: String? = try db.query(
+            "SELECT native_turn_id FROM turns WHERE thread_id=? ORDER BY ordinal DESC LIMIT 1",
+            [threadId]) { $0.text(0) }.first
+        var nextTurnOrdinal = Int(try db.scalarInt(
+            "SELECT COALESCE(MAX(ordinal),0) FROM turns WHERE thread_id=?", [threadId]))
+
+        func turnId(for item: ItemInput) throws -> String? {
+            let native = [item.turnId, turnNativeId].compactMap { $0 }.first { !$0.isEmpty }
+                ?? lastNativeTurn
+            guard let native, !native.isEmpty else { return nil }
+            if let cached = turnCache[native] { return cached }
+            let existing = try db.query("SELECT id FROM turns WHERE thread_id=? AND native_turn_id=?",
+                                        [threadId, native]) { $0.text(0) }.first
+            let id: String
+            if let existing {
+                id = existing
+            } else {
+                nextTurnOrdinal += 1
+                id = UUID().uuidString
                 try db.run("INSERT INTO turns(id,thread_id,native_turn_id,ordinal,status) VALUES(?,?,?,?,?)",
-                           [id, threadId, turnNativeId, 0, "completed"])
-                turnId = id
+                           [id, threadId, native, nextTurnOrdinal, "completed"])
             }
+            turnCache[native] = id
+            lastNativeTurn = native
+            return id
         }
         try db.transaction {
             for item in items {
+                let itemTurnId = try turnId(for: item)
                 let masked = Redactor.mask(item.text)
                 redacted += masked.hits
                 let id = UUID().uuidString
@@ -164,7 +243,7 @@ final class Store {
                 INSERT INTO items(id,thread_id,turn_id,native_item_id,ordinal,item_type,role,created_at,text,raw_json,truncated)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(thread_id,native_item_id) DO NOTHING
-                """, [id, threadId, turnId, item.nativeId, item.ordinal, item.itemType, item.role,
+                """, [id, threadId, itemTurnId, item.nativeId, item.ordinal, item.itemType, item.role,
                       item.createdAt, masked.text, rawToStore, item.truncated ? 1 : 0])
                 let rowid: Int64
                 if db.changes > 0 {
@@ -176,9 +255,10 @@ final class Store {
                     guard let rid = rows.first else { continue }
                     rowid = rid
                     try db.run("""
-                    UPDATE items SET ordinal=?, item_type=?, role=?, created_at=?, text=?, raw_json=?, truncated=?
+                    UPDATE items SET turn_id=COALESCE(?,turn_id), ordinal=?, item_type=?, role=?,
+                        created_at=?, text=?, raw_json=?, truncated=?
                     WHERE rowid=?
-                    """, [item.ordinal, item.itemType, item.role, item.createdAt, masked.text, rawToStore,
+                    """, [itemTurnId, item.ordinal, item.itemType, item.role, item.createdAt, masked.text, rawToStore,
                           item.truncated ? 1 : 0, rid])
                     try db.run("DELETE FROM search_docs WHERE rowid=?", [rid])
                 }
@@ -186,6 +266,15 @@ final class Store {
                 if !seg.isEmpty {
                     try db.run("INSERT INTO search_docs(rowid,seg) VALUES(?,?)", [rowid, seg])
                 }
+            }
+            // 轮次的起止时间按它下面条目的时间取，来源给了原生时间也不用，避免两套口径打架。
+            for id in Set(turnCache.values) {
+                try db.run("""
+                UPDATE turns SET
+                    started_at=(SELECT MIN(created_at) FROM items WHERE turn_id=turns.id AND created_at>0),
+                    completed_at=(SELECT MAX(created_at) FROM items WHERE turn_id=turns.id)
+                WHERE id=? AND EXISTS(SELECT 1 FROM items WHERE turn_id=turns.id)
+                """, [id])
             }
             let count = try db.scalarInt("SELECT COUNT(*) FROM items WHERE thread_id=?", [threadId])
             try db.run("UPDATE threads SET item_count=? WHERE id=?", [count, threadId])
@@ -218,11 +307,10 @@ final class Store {
     }
 
     func threads(sourceKind: SourceKind? = nil, projectPath: String? = nil,
-                 query: String? = nil, limit: Int = 300) throws -> [ThreadRow] {
-        var sql = """
-        SELECT t.id,t.source_id,t.native_id,t.cwd,t.title,t.updated_at,t.item_count,t.thread_source,t.archived
-        FROM threads t WHERE 1=1
-        """
+                 query: String? = nil, limit: Int = 300,
+                 mergeCopies: Bool = false, before: Int64? = nil,
+                 beforeId: String? = nil) throws -> [ThreadRow] {
+        var sql = threadSelectBase
         var binds: [Any?] = []
         if let kind = sourceKind { sql += " AND t.source_id=?"; binds.append(kind.rawValue) }
         if let path = projectPath { sql += " AND t.cwd=?"; binds.append(path) }
@@ -230,59 +318,113 @@ final class Store {
             sql += " AND (t.title LIKE ? OR t.preview LIKE ?)"
             binds.append("%\(q)%"); binds.append("%\(q)%")
         }
-        sql += " ORDER BY t.updated_at DESC LIMIT ?"
-        binds.append(limit)
+        if mergeCopies { sql += " AND COALESCE(l.role,'')<>'copy'" }
+        // 按 updated_at 倒序翻页：给一个游标就只取更早的，比 offset 数页稳。
+        // 同一毫秒可能有好几个会话（真实库里有 15 对），光比时间戳会把跨界的那几个漏掉或重复，
+        // 所以再拿 id 当第二把尺子。
+        if let before {
+            if let beforeId, !beforeId.isEmpty {
+                sql += " AND (t.updated_at<? OR (t.updated_at=? AND t.id<?))"
+                binds.append(before); binds.append(before); binds.append(beforeId)
+            } else {
+                sql += " AND t.updated_at<?"
+                binds.append(before)
+            }
+        }
+        sql += " ORDER BY t.updated_at DESC, t.id DESC LIMIT ?"
+        // 负数进 SQLite 的 LIMIT 意思是「不限」，调用方一个笔误就会把整库搬进内存。
+        binds.append(max(1, min(limit, 5000)))
         return try db.query(sql, binds) { st in
             ThreadRow(id: st.text(0), sourceId: st.text(1),
                       sourceKind: SourceKind(rawValue: st.text(1)) ?? .codex,
                       nativeId: st.text(2), projectPath: st.text(3), title: st.text(4),
                       updatedAt: st.int64(5), itemCount: st.int(6),
-                      threadSource: st.text(7), archived: st.int(8) == 1)
+                      threadSource: st.text(7), archived: st.int(8) == 1,
+                      copyCount: max(0, st.int(11) - 1),
+                      familyId: st.text(9).isEmpty ? nil : st.text(9),
+                      lineageRole: st.text(10))
         }
     }
 
+    /// 当前筛选条件下的会话总数。列表分页后要靠它说明「还有多少没显示」。
+    func threadCount(sourceKind: SourceKind? = nil, projectPath: String? = nil,
+                     mergeCopies: Bool = false) throws -> Int {
+        var sql = """
+        SELECT COUNT(*) FROM threads t
+        LEFT JOIN thread_links l ON l.thread_id=t.id
+        WHERE 1=1
+        """
+        var binds: [Any?] = []
+        if let kind = sourceKind { sql += " AND t.source_id=?"; binds.append(kind.rawValue) }
+        if let path = projectPath { sql += " AND t.cwd=?"; binds.append(path) }
+        if mergeCopies { sql += " AND COALESCE(l.role,'')<>'copy'" }
+        return Int(try db.scalarInt(sql, binds))
+    }
+
+    private var threadSelectBase: String {
+        """
+        SELECT t.id,t.source_id,t.native_id,t.cwd,t.title,t.updated_at,t.item_count,t.thread_source,t.archived,
+               COALESCE(l.family_id,''),COALESCE(l.role,''),COALESCE(f.member_count,1)
+        FROM threads t
+        LEFT JOIN thread_links l ON l.thread_id=t.id
+        LEFT JOIN thread_families f ON f.id=l.family_id
+        WHERE 1=1
+        """
+    }
+
     func thread(id: String) throws -> ThreadRow? {
-        try db.query("""
-        SELECT t.id,t.source_id,t.native_id,t.cwd,t.title,t.updated_at,t.item_count,t.thread_source,t.archived
-        FROM threads t WHERE t.id=?
-        """, [id]) { st in
+        try db.query(threadSelectBase + " AND t.id=?", [id]) { st in
             ThreadRow(id: st.text(0), sourceId: st.text(1),
                       sourceKind: SourceKind(rawValue: st.text(1)) ?? .codex,
                       nativeId: st.text(2), projectPath: st.text(3), title: st.text(4),
                       updatedAt: st.int64(5), itemCount: st.int(6),
-                      threadSource: st.text(7), archived: st.int(8) == 1)
+                      threadSource: st.text(7), archived: st.int(8) == 1,
+                      copyCount: max(0, st.int(11) - 1),
+                      familyId: st.text(9).isEmpty ? nil : st.text(9),
+                      lineageRole: st.text(10))
         }.first
     }
 
     func items(threadId: String, afterOrdinal: Int = -1, limit: Int = 200) throws -> [ItemRow] {
         try db.query("""
-        SELECT id,thread_id,ordinal,item_type,role,created_at,text,truncated
-        FROM items WHERE thread_id=? AND ordinal>? ORDER BY ordinal LIMIT ?
-        """, [threadId, afterOrdinal, limit]) { st in
+        SELECT i.id,i.thread_id,i.ordinal,i.item_type,i.role,i.created_at,i.text,i.truncated,
+               COALESCE(t.ordinal,0)
+        FROM items i LEFT JOIN turns t ON t.id=i.turn_id
+        WHERE i.thread_id=? AND i.ordinal>? ORDER BY i.ordinal LIMIT ?
+        """, [threadId, afterOrdinal, max(1, limit)]) { st in
+            // 只挡负数：SQLite 里 LIMIT 为负等于不限。导出要一次拿完整会话，所以不设上限。
             ItemRow(id: st.text(0), threadId: st.text(1), ordinal: st.int(2),
                     itemType: st.text(3), role: st.text(4), createdAt: st.int64(5),
-                    text: st.text(6), truncated: st.int(7) == 1)
+                    text: st.text(6), truncated: st.int(7) == 1, turnOrdinal: st.int(8))
         }
     }
 
-    func search(_ query: String, sourceKind: SourceKind? = nil, limit: Int = 60) throws -> [SearchHit] {
-        let match = TextTools.makeMatchQuery(query)
-        guard !match.isEmpty else { return [] }
-        var sql = """
-        SELECT i.id,i.thread_id,t.title,t.source_id,i.item_type,i.created_at,i.text,i.ordinal
-        FROM search_docs JOIN items i ON i.rowid=search_docs.rowid
-        JOIN threads t ON t.id=i.thread_id
-        WHERE search_docs MATCH ?
-        """
-        var binds: [Any?] = [match]
-        if let kind = sourceKind { sql += " AND t.source_id=?"; binds.append(kind.rawValue) }
-        sql += " ORDER BY rank LIMIT ?"
-        binds.append(limit)
-        return try db.query(sql, binds) { st in
-            SearchHit(id: st.text(0), threadId: st.text(1), threadTitle: st.text(2),
-                      sourceKind: SourceKind(rawValue: st.text(3)) ?? .codex,
-                      itemType: st.text(4), createdAt: st.int64(5), text: st.text(6), ordinal: st.int(7))
+    struct TurnRow: Identifiable {
+        let id: String
+        let ordinal: Int
+        let startedAt: Int64
+        let completedAt: Int64
+        var itemCount: Int = 0
+        /// 这一轮的第一个问题，列表里当轮次摘要用。
+        var prompt: String = ""
+    }
+
+    func turns(threadId: String) throws -> [TurnRow] {
+        try db.query("""
+        SELECT t.id,t.ordinal,t.started_at,t.completed_at,
+               (SELECT COUNT(*) FROM items i WHERE i.turn_id=t.id),
+               COALESCE((SELECT i.text FROM items i WHERE i.turn_id=t.id AND i.role='user'
+                         ORDER BY i.ordinal LIMIT 1),'')
+        FROM turns t WHERE t.thread_id=? ORDER BY t.ordinal
+        """, [threadId]) { st in
+            TurnRow(id: st.text(0), ordinal: st.int(1), startedAt: st.int64(2),
+                    completedAt: st.int64(3), itemCount: st.int(4), prompt: st.text(5))
         }
+    }
+
+    /// 某一轮第一条记录在会话里的序号，跳轮次时按它算偏移。
+    func firstItemOrdinal(turnId: String) throws -> Int? {
+        try db.query("SELECT MIN(ordinal) FROM items WHERE turn_id=?", [turnId]) { $0.int(0) }.first
     }
 
     struct Stats {

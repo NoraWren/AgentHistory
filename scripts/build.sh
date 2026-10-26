@@ -22,7 +22,14 @@ swiftc -swift-version 5 -O -target "$TARGET" \
   -o "$BUILD/AgentHistory" -lsqlite3
 
 echo "[4/4] 组装应用包"
-rm -rf "$APP"
+if [ -e "$APP" ]; then
+  OLD="$BUILD/AgentHistory.app.old.$(date +%s)"
+  mv "$APP" "$OLD"
+  # 只留最近一份旧包，避免 .build 越堆越大
+  ls -dt "$BUILD"/AgentHistory.app.old.* 2>/dev/null | tail -n +2 | while read -r d; do
+    find "$d" -delete 2>/dev/null || true
+  done
+fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BUILD/AgentHistory" "$APP/Contents/MacOS/AgentHistory"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"

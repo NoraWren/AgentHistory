@@ -55,7 +55,9 @@ private func firstLine(_ s: String, _ n: Int = 80) -> String {
 
 final class CodexAdapter: HistoryAdapter {
     let kind: SourceKind = .codex
-    private let home = NSHomeDirectory() + "/.codex"
+    /// 允许用 AGENT_HISTORY_CODEX_HOME 指向别的 Codex 目录，方便验收和排查。
+    private let home = ProcessInfo.processInfo.environment["AGENT_HISTORY_CODEX_HOME"]
+        ?? NSHomeDirectory() + "/.codex"
     private var statePath: String?
     private var historyPath: String?
 
@@ -110,11 +112,11 @@ final class CodexAdapter: HistoryAdapter {
             let watermark = try store.watermark(sourceId: kind.rawValue, threadId: meta.id)
             let after = Int64(watermark ?? "0") ?? 0
             let rows = try history.query("""
-            SELECT item_id,rollout_ordinal,item_type,created_at_ms,item_json,updated_at_ordinal
+            SELECT item_id,rollout_ordinal,item_type,created_at_ms,item_json,updated_at_ordinal,turn_id
             FROM thread_items WHERE thread_id=? AND updated_at_ordinal>?
             ORDER BY rollout_ordinal
             """, [meta.id, after]) { st in
-                (st.text(0), st.int(1), st.text(2), st.int64(3), st.text(4), st.int64(5))
+                (st.text(0), st.int(1), st.text(2), st.int64(3), st.text(4), st.int64(5), st.text(6))
             }
             if rows.isEmpty {
                 if index % 50 == 0 {
@@ -126,7 +128,7 @@ final class CodexAdapter: HistoryAdapter {
             var inputs: [ItemInput] = []
             var maxOrdinal = after
             var preview = ""
-            for (nativeId, ordinal, type, created, raw, updatedOrdinal) in rows {
+            for (nativeId, ordinal, type, created, raw, updatedOrdinal, nativeTurn) in rows {
                 maxOrdinal = max(maxOrdinal, updatedOrdinal, Int64(ordinal))
                 guard let text = Self.extractText(type: type, raw: raw) else { continue }
                 if preview.isEmpty && (type == "userMessage" || type == "agentMessage") {
@@ -134,7 +136,8 @@ final class CodexAdapter: HistoryAdapter {
                 }
                 inputs.append(ItemInput(nativeId: nativeId, ordinal: ordinal, itemType: type,
                                         role: Self.role(for: type), createdAt: created,
-                                        text: text, rawJSON: clip(raw, 4000), truncated: raw.count > 4000))
+                                        text: text, rawJSON: clip(raw, 4000), truncated: raw.count > 4000,
+                                        turnId: nativeTurn.isEmpty ? nil : nativeTurn))
             }
             let threadId = try store.upsertThread(ThreadInput(
                 sourceId: kind.rawValue, nativeId: meta.id, projectPath: meta.cwd,
@@ -201,10 +204,10 @@ final class CodexAdapter: HistoryAdapter {
 
 final class ClaudeAdapter: HistoryAdapter {
     let kind: SourceKind = .claude
-    private let root = NSHomeDirectory() + "/.claude/projects"
+    private let root = WriteSupport.claudeProjects
 
     var isAvailable: Bool { FileManager.default.fileExists(atPath: root) }
-    var unavailableReason: String? { isAvailable ? nil : "未找到 ~/.claude/projects" }
+    var unavailableReason: String? { isAvailable ? nil : "未找到 \(root)" }
 
     func sync(into store: Store, progress: (SyncPhase) -> Void) throws -> Int {
         let dirs = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
@@ -245,13 +248,16 @@ final class ClaudeAdapter: HistoryAdapter {
                 ordinal += 1
                 if ts > 0 { minTs = min(minTs, ts); maxTs = max(maxTs, ts) }
                 let nativeId = obj["uuid"] as? String ?? "\(sessionId)-\(start)-\(ordinal)"
+                // Claude 给每条记录都打了 promptId，同一轮提问及其回复共享一个值。
+                let nativeTurn = (obj["promptId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 if type == "user" {
                     let msg = obj["message"] as? [String: Any] ?? [:]
                     let content = Self.flatten(msg["content"])
                     if !content.isEmpty {
                         if title.isEmpty { title = firstLine(content, 100) }
                         inputs.append(ItemInput(nativeId: nativeId, ordinal: ordinal, itemType: "userMessage",
-                                                role: "user", createdAt: ts, text: content, rawJSON: clip(String(line), 3000)))
+                                                role: "user", createdAt: ts, text: content,
+                                                rawJSON: clip(String(line), 3000), turnId: nativeTurn))
                     }
                 } else if type == "assistant" {
                     let msg = obj["message"] as? [String: Any] ?? [:]
@@ -261,11 +267,14 @@ final class ClaudeAdapter: HistoryAdapter {
                         inputs.append(ItemInput(nativeId: "\(nativeId)-b\(bi)", ordinal: ordinal * 100 + bi,
                                                 itemType: bt == "thinking" ? "reasoning" : "agentMessage",
                                                 role: bt == "thinking" ? "reasoning" : "assistant",
-                                                createdAt: ts, text: t, rawJSON: clip(String(line), 3000)))
+                                                createdAt: ts, text: t, rawJSON: clip(String(line), 3000),
+                                                turnId: nativeTurn))
                     }
                 }
             }
             guard !inputs.isEmpty || !cwd.isEmpty else { continue }
+            // 汇编时的工作目录会被 claude 记成会话，这些是工具中间产物，不当成我的对话收进来。
+            if LLMRunner.isScratchPath(cwd) { continue }
             let threadId = try store.upsertThread(ThreadInput(
                 sourceId: kind.rawValue, nativeId: sessionId, projectPath: cwd.isEmpty ? "/(未知)" : cwd,
                 title: title.isEmpty ? "Claude 会话 \(sessionId.prefix(8))" : title,
@@ -297,11 +306,14 @@ final class ClaudeAdapter: HistoryAdapter {
 
 final class WorkBuddyAdapter: HistoryAdapter {
     let kind: SourceKind = .workbuddy
-    private let root = NSHomeDirectory() + "/.workbuddy/projects"
-    private let dbPath = NSHomeDirectory() + "/.workbuddy/workbuddy.db"
+    private let root = WriteSupport.workbuddyProjects
+    /// 会话表在 projects 的同级目录，跟着 projects 的位置走，方便整体指到别的目录。
+    private var dbPath: String {
+        (root as NSString).deletingLastPathComponent + "/workbuddy.db"
+    }
 
     var isAvailable: Bool { FileManager.default.fileExists(atPath: root) }
-    var unavailableReason: String? { isAvailable ? nil : "未找到 ~/.workbuddy/projects" }
+    var unavailableReason: String? { isAvailable ? nil : "未找到 \(root)" }
 
     func sync(into store: Store, progress: (SyncPhase) -> Void) throws -> Int {
         var titles: [String: String] = [:]
@@ -357,7 +369,9 @@ final class WorkBuddyAdapter: HistoryAdapter {
                     guard !content.isEmpty else { continue }
                     inputs.append(ItemInput(nativeId: nativeId, ordinal: ordinal,
                                             itemType: role == "user" ? "userMessage" : "agentMessage",
-                                            role: role, createdAt: ts, text: content, rawJSON: clip(String(line), 3000)))
+                                            role: role, createdAt: ts, text: content,
+                                            rawJSON: clip(String(line), 3000),
+                                            turnId: role == "user" ? nativeId : nil))
                 case "reasoning":
                     let content = (obj["rawContent"] as? [[String: Any]] ?? [])
                         .compactMap { $0["text"] as? String }.joined(separator: "\n")
@@ -400,10 +414,15 @@ final class WorkBuddyAdapter: HistoryAdapter {
 
 final class OpenCodeAdapter: HistoryAdapter {
     let kind: SourceKind = .opencode
-    private let dbPath = NSHomeDirectory() + "/.local/share/opencode/opencode.db"
+    /// 跟 OpenCode 自己的规则一致，认 XDG_DATA_HOME，方便把数据指到别的目录。
+    private let dbPath = {
+        let dataHome = ProcessInfo.processInfo.environment["XDG_DATA_HOME"]
+            ?? NSHomeDirectory() + "/.local/share"
+        return dataHome + "/opencode/opencode.db"
+    }()
 
     var isAvailable: Bool { FileManager.default.fileExists(atPath: dbPath) }
-    var unavailableReason: String? { isAvailable ? nil : "未找到 opencode.db" }
+    var unavailableReason: String? { isAvailable ? nil : "未找到 \(dbPath)" }
 
     func sync(into store: Store, progress: (SyncPhase) -> Void) throws -> Int {
         guard isAvailable else { return 0 }
@@ -440,7 +459,8 @@ final class OpenCodeAdapter: HistoryAdapter {
                     inputs.append(ItemInput(nativeId: pid, ordinal: ordinal,
                                             itemType: role == "user" ? "userMessage" : "agentMessage",
                                             role: role, createdAt: createdMs, text: t,
-                                            rawJSON: clip(pdata, 3000)))
+                                            rawJSON: clip(pdata, 3000),
+                                            turnId: role == "user" ? mid : nil))
                 }
             }
             let threadId = try store.upsertThread(ThreadInput(
@@ -496,7 +516,7 @@ final class KimiAdapter: HistoryAdapter {
 
     var isAvailable: Bool { !sessionDirectories.isEmpty }
     var unavailableReason: String? {
-        isAvailable ? nil : "未找到 Kimi Code 会话（~/.kimi-code/sessions 为空或不存在）"
+        isAvailable ? nil : "未找到 Kimi Code 会话（\(sessionsRoot) 为空或不存在）"
     }
 
     private func loadWorkspaces() {
@@ -573,8 +593,11 @@ final class KimiAdapter: HistoryAdapter {
                             let role = message["role"] as? String ?? ""
                             let nativeId = (message["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                                 ?? "\(sessionId)-\(lineOffset)"
+                            // Kimi 的 wire 没有轮次字段：一条用户消息开一轮，其后所有回复算这一轮。
+                            let turnKey = role == "user" ? nativeId : nil
                             for item in Self.items(message: message, role: role, nativeId: nativeId,
-                                                   createdAt: ts > 0 ? ts : lastTs, ordinal: &ordinal) {
+                                                   createdAt: ts > 0 ? ts : lastTs, ordinal: &ordinal,
+                                                   turnKey: turnKey) {
                                 if title.isEmpty, item.role == "user" { title = firstLine(item.text, 120) }
                                 inputs.append(item)
                             }
@@ -600,7 +623,7 @@ final class KimiAdapter: HistoryAdapter {
     }
 
     static func items(message: [String: Any], role: String, nativeId: String,
-                      createdAt: Int64, ordinal: inout Int) -> [ItemInput] {
+                      createdAt: Int64, ordinal: inout Int, turnKey: String? = nil) -> [ItemInput] {
         var out: [ItemInput] = []
         let textRole = role == "user" ? "user" : (role == "assistant" ? "assistant" : role)
         let textType = role == "user" ? "userMessage" : (role == "assistant" ? "agentMessage" : "systemMessage")
@@ -610,7 +633,8 @@ final class KimiAdapter: HistoryAdapter {
             guard !text.isEmpty else { return }
             ordinal += 1
             out.append(ItemInput(nativeId: id, ordinal: ordinal, itemType: type, role: role,
-                                 createdAt: createdAt, text: text, rawJSON: "", truncated: truncated))
+                                 createdAt: createdAt, text: text, rawJSON: "", truncated: truncated,
+                                 turnId: turnKey))
         }
 
         if let plain = message["content"] as? String {
@@ -718,7 +742,8 @@ final class DeepSeekAdapter: HistoryAdapter {
     var unavailableReason: String? {
         let files = sessionFiles
         if files.isEmpty {
-            return "未找到 DeepSeek Harness 会话（harness/sessions 为空或不存在）"
+            let where_ = roots.isEmpty ? "未找到 DeepSeek Harness 数据目录" : roots.joined(separator: "、")
+            return "未找到 DeepSeek Harness 会话（\(where_) 下的 sessions 为空或不存在）"
         }
         if files.contains(where: { $0.hasSuffix(".zstd") }), Self.zstdPath() == nil {
             return "未找到 zstd 解压工具，无法读取会话"
@@ -789,11 +814,13 @@ final class DeepSeekAdapter: HistoryAdapter {
                         ?? "\(sessionId)-\(seq)"
                     items.append(ItemInput(nativeId: nativeId, ordinal: Int(seq) * 100,
                                            itemType: "userMessage", role: "user",
-                                           createdAt: time, text: content, rawJSON: ""))
+                                           createdAt: time, text: content, rawJSON: "",
+                                           turnId: Self.turnKey(sessionId, data) ?? nativeId))
                 case "assistant/message":
                     guard let data = obj["data"] as? [String: Any],
                           let message = data["message"] as? [String: Any],
                           let parts = message["content"] as? [[String: Any]] else { continue }
+                    let turnKey = Self.turnKey(sessionId, data)
                     for (pi, part) in parts.enumerated() {
                         let partType = part["type"] as? String ?? ""
                         let nativeId = "\(sessionId)-\(seq)-p\(pi)"
@@ -802,19 +829,20 @@ final class DeepSeekAdapter: HistoryAdapter {
                             guard !body.isEmpty else { continue }
                             items.append(ItemInput(nativeId: nativeId, ordinal: Int(seq) * 100 + pi,
                                                    itemType: "agentMessage", role: "assistant",
-                                                   createdAt: time, text: body, rawJSON: ""))
+                                                   createdAt: time, text: body, rawJSON: "", turnId: turnKey))
                         } else if partType == "reasoning" || partType == "think" {
                             let body = (part["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !body.isEmpty else { continue }
                             items.append(ItemInput(nativeId: nativeId, ordinal: Int(seq) * 100 + pi,
                                                    itemType: "reasoning", role: "reasoning",
-                                                   createdAt: time, text: body, rawJSON: ""))
+                                                   createdAt: time, text: body, rawJSON: "", turnId: turnKey))
                         } else if partType == "tool-call" {
                             let name = part["name"] as? String ?? "工具调用"
                             let args = clip(jsonString(part["arguments"]), 600)
                             items.append(ItemInput(nativeId: nativeId, ordinal: Int(seq) * 100 + pi,
                                                    itemType: "commandExecution", role: "tool",
-                                                   createdAt: time, text: name + " " + args, rawJSON: ""))
+                                                   createdAt: time, text: name + " " + args, rawJSON: "",
+                                                   turnId: turnKey))
                         }
                     }
                 case "tool/result":
@@ -827,7 +855,8 @@ final class DeepSeekAdapter: HistoryAdapter {
                     items.append(ItemInput(nativeId: "\(sessionId)-\(seq)-r", ordinal: Int(seq) * 100,
                                            itemType: "toolResult", role: "tool",
                                            createdAt: time, text: clip(body, 1500), rawJSON: "",
-                                           truncated: body.count > 1500))
+                                           truncated: body.count > 1500,
+                                           turnId: Self.turnKey(sessionId, data)))
                 default:
                     continue
                 }
@@ -858,6 +887,14 @@ final class DeepSeekAdapter: HistoryAdapter {
         guard let source = data["source"] as? [String: Any] else { return true }
         let kind = source["kind"] as? String ?? ""
         return kind == "user" || kind == "cli" || kind == "acp"
+    }
+
+    /// DeepSeek 的回复里带原生轮次号（`data.turn`），用户消息有时没有，
+    /// 所以把轮次号拼上会话 ID 当标识；拿不到时返回 nil，接在会话最后一轮后面。
+    static func turnKey(_ sessionId: String, _ data: [String: Any]) -> String? {
+        if let turn = data["turn"] as? NSNumber { return "\(sessionId)-t\(turn.intValue)" }
+        if let turn = data["turn"] as? Int { return "\(sessionId)-t\(turn)" }
+        return nil
     }
 
     static func contentText(_ value: Any?) -> String {
