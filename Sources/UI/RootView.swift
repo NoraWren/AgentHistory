@@ -59,6 +59,14 @@ struct RootView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
+                    model.showOnboarding = true
+                } label: {
+                    Label("MCP 接入", systemImage: "point.3.connected.trianglepath.dotted")
+                }
+                .help("让别的 AI 客户端也能查这份历史")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
                     model.showSync = true
                 } label: {
                     Label("同步", systemImage: "arrow.triangle.2.circlepath")
@@ -74,6 +82,9 @@ struct RootView: View {
         }
         .sheet(isPresented: Binding(get: { model.showDigest }, set: { model.showDigest = $0 })) {
             DigestView(model: model)
+        }
+        .sheet(isPresented: Binding(get: { model.showOnboarding }, set: { model.showOnboarding = $0 })) {
+            MCPOnboardingView(model: model.onboarding)
         }
         .onReceive(NotificationCenter.default.publisher(for: .focusSearch)) { _ in
             model.searchFocused = true

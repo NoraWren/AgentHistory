@@ -54,6 +54,9 @@ final class AppModel: ObservableObject {
     @Published var totals = (all: 0, merged: 0)
     @Published var showSync = false
     @Published var showStatus = false
+    @Published var showOnboarding = false
+    /// 接入面板的状态。菜单栏要读它，所以放在 model 上带着跑。
+    let onboarding = MCPOnboardingModel()
     @Published var highlightItemId: String?
     /// 每次主动跳转都加一。只靠 highlightItemId 的话，连着点同一轮或者
     /// 重新进同一个命中，id 没变，SwiftUI 不会重新触发滚动。
@@ -403,6 +406,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let model = AppModel(store: store)
         self.model = model
         if ProcessInfo.processInfo.environment["AGENT_HISTORY_AUTO_SYNC"] == "1" { model.showSync = true }
+        // 验收用：直接把接入面板打开，省得每次手点。
+        if ProcessInfo.processInfo.environment["AGENT_HISTORY_AUTO_ONBOARD"] == "1" { model.showOnboarding = true }
         if ProcessInfo.processInfo.environment["AGENT_HISTORY_AUTO_SELECT"] == "1", let first = model.threads.first {
             model.select(first)
         }
@@ -429,6 +434,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         installStatusItem()
         registerHotKey()
         buildMenu()
+        // 启动后先静默查一遍谁接上了，菜单栏那一行才有内容。查一次六个子进程，几秒钟内完成。
+        model.onboarding.refresh()
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             uiLog("check visible=\(String(describing: self.window?.isVisible)) frame=\(String(describing: self.window?.frame)) windows=\(NSApp.windows.count)")
         }
@@ -478,6 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "同步全部来源", action: #selector(syncAll), keyEquivalent: "r"))
         appMenu.addItem(NSMenuItem(title: "主题汇编…", action: #selector(openDigest), keyEquivalent: "d"))
+        appMenu.addItem(NSMenuItem(title: "MCP 接入…", action: #selector(openOnboarding), keyEquivalent: ""))
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appItem.submenu = appMenu
@@ -489,6 +497,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func openDigest() {
         showWindow()
         model?.showDigest = true
+    }
+
+    @objc func openOnboarding() {
+        showWindow()
+        model?.showOnboarding = true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -550,6 +563,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let bad = NSMenuItem(title: "\(failed.count) 个来源同步出错", action: nil, keyEquivalent: "")
             bad.isEnabled = false
             menu.addItem(bad)
+        }
+
+        // 接入结论只写一行。「没接上」是常态，别弹窗；只有本来能用却连不上才提示。
+        let onboarding = model.onboarding
+        if !onboarding.reports.isEmpty {
+            let line = NSMenuItem(title: "MCP " + onboarding.summary, action: nil, keyEquivalent: "")
+            line.isEnabled = false
+            menu.addItem(line)
+            let failures = onboarding.failures
+            if !failures.isEmpty {
+                let names = failures.prefix(2).map(\.displayName).joined(separator: "、")
+                let bad = NSMenuItem(title: "\(names)\(failures.count > 2 ? " 等 \(failures.count) 个" : "") 已接入但连不上",
+                                     action: #selector(openOnboarding), keyEquivalent: "")
+                bad.target = self
+                bad.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
+                menu.addItem(bad)
+            }
         }
 
         menu.addItem(.separator())
