@@ -74,6 +74,24 @@ AgentHistory collects the session history of local AI coding clients into one se
 
 同步仍然由你手动点「同步」，没有加定时。自动同步意味着后台随时读写四百兆的库，也和「写入动作都要你按一次」的约定冲突。
 
+## 记忆召回
+
+会话检索解决的是「哪次聊过」，但真正反复要用的往往是聊出来的结论。交接包和汇编躺在 `~/.agent-history/handoffs/`、`digests/` 里，改版前只有翻文件才看得到，agent 那边完全不知道它们存在。现在这两类产物都会登记进库，和结论一起走同一条检索通道。
+
+记忆放在独立的 `memory_docs` 表和配套的 `memory_docs_fts` 里，不往会话表塞伪造行。会话数、条目数、项目列表、血缘重建都按 `items` 和 `threads` 算，混进文件文档会把这些数字和统计口径一起带歪。三张表各管各的，检索的时候在结果层合并。
+
+三类记忆各有来路。`handoff` 是交接包，`append_handoff` 写盘后立刻登记，同一次调用内就能检索到；`digest` 是汇编产物，生成完自动登记；`fact` 是结论条目，靠 agent 在做事时主动写。结论只做三件事：写进去、按关键词取回来、不用了作废。没有定时批量提炼，也就不会在你不看的时候凭空生成一堆没人认领的判断。
+
+结论带两个硬约束。一是内容指纹判重：同一会话同一句话写两次只留一行，比较前去掉空白和末尾的中英标点，所以「这样改。」和「这样改」算同一条。二是出处可追溯，每条记下来源会话和条目序号，取回时能顺着跳回去看上下文；来源会话后来被删了，取回会标明「来源已不在」，不给你一个点不动的链接。
+
+结论会过时，所以有取代和作废两条路，都只改状态、不动正文。新结论可以指定取代哪一条，旧的标成已取代并指向新的；判断错了用 `forget` 作废。默认检索和清单都不返回失效的条目，勾上「包含失效」还能看回来，正文一个字都没丢。交接包和汇编是文件产物，作废没有意义，`forget` 只接受结论。
+
+MCP 那边加了四个工具，总数从六个到十一个。`remember` 写结论，`recall` 取结论（可按关键词、类别、会话过滤，默认不给失效的），`forget` 作废，`list_handoffs` 与 `get_handoff` 分别列和取交接包。`search_threads` 多一个 `scope` 参数，取 `threads`、`memory`、`all`，不传就是原来的行为。
+
+界面上检索栏左侧多了范围切换，结果行按类别上色，前缀写着「[汇编]」「[交接包]」「[决策]」这类标签。点开汇编和交接包直接打开文件；文件被挪走了，就用索引里的正文兜底并说明来龙去脉，不会给你一个空白页。工具栏「记忆」按钮按交接包、汇编、结论分三段列出，结论还能按类别筛、看来源会话、当场作废。
+
+边界说清楚：这条通道是 FTS5 词法检索，没有向量化，找不到同义改写，问「服务器升级谁负责」而原文写的是「Nexus 归运维」就匹配不上。结论能不能积累起来，取决于 agent 有没有在当下就写下来，没写的那一刻过去就过去了。
+
 ## 命令行
 
 不打开界面也能用，适合脚本和排查。
@@ -93,6 +111,9 @@ AgentHistory rebuild-lineage              # 重建会话血缘，把同步产生
 AgentHistory lineage <会话ID>             # 查看某会话的双向血缘（原创与副本）
 AgentHistory search 止损线 --days 7 --asked --source codex  # 带筛选的会话级检索
 AgentHistory search 表格 --all            # 关闭副本合并，命中副本也单独返回
+AgentHistory search 服务器 --scope memory  # 只查记忆：交接包、汇编、结论
+AgentHistory search 服务器 --scope all     # 会话和记忆一起查，结果按类别标注
+AgentHistory memory-backfill              # 把已有的交接包与汇编补进检索索引
 AgentHistory export <会话ID> --out 目录    # 把会话导出成 Markdown
 AgentHistory digest --days 7 --title 本周   # 把最近七天汇编成结论（命令自动探测）
 AgentHistory digest --days 7 --no-llm      # 只出按天摘要，不调外部模型
@@ -106,6 +127,7 @@ AgentHistory mcp-status --json            # 同上，给脚本解析
 AgentHistory mcp-connect claude           # 接入某个客户端，--dry-run 只看改动
 AgentHistory mcp-disconnect claude        # 移除本服务的登记
 AgentHistory mcp-repair                   # 应用挪了位置，把失效路径一次改回来
+AgentHistory mcp-repair --dry-run         # 只看哪些登记要改，不动文件
 AgentHistory mcp-snippet codex            # 打出可粘贴的配置片段
 ```
 
@@ -224,6 +246,12 @@ bash scripts/build.sh
 
 ## 验证记录
 
+- 2026-10-26 应用图标最终与界面统一。侧栏左上角本来就是「Theme.accent 渐变圆角方块 + 白色 brain.head.profile 符号」，界面和 Dock 两个记忆点理应一致，所以图标改成同一副：4096 画布上先画和侧栏一致的 45 度渐变底，再用 AppKit 渲染同一个 SF Symbol 白色符号缩放到 62% 居中，缩到 1024 后打包 icns。`make_icon.py` 之外新增 `make_icon.swift` 作为符号渲染一环，整套仍可一键重生成。235 项测试全过、0 失败。
+
+2026-10-26 记忆召回上线。交接包和汇编以前只能翻文件，agent 完全不知道它们存在，典型案例是汇编里早就写下「Nexus 升级是公司服务器的事，和开源项目没关系」，下一轮对话里还是照着错的假设往下做。这次把三类记忆（交接包、汇编、结论）收进独立表 `memory_docs` 与 `memory_docs_fts`，不往会话表塞伪造行，避免污染会话数、条目数、项目列表和血缘重建。隔离副本上用迁移前的备份跑了一遍：迁移前 `threads 2331 / items 220654 / handoffs 1528 / search_docs 218456`，迁移后四项一字不差，补录收进 23 份（汇编 4、交接包 19），第二次执行报「新增 0 份，跳过 23 份，清掉 0 份」，幂等成立；`search 服务器 --scope memory` 命中 5 份，每行带 `memory_id`；`mcp-status` 仍是 6/6、退出码 0。真实库已迁移完成，`threads` 与 `handoffs` 不变，`items` 多出的 318 条是期间正常同步进来的新记录。
+
+同一轮里发现一个真问题：`mcp-repair` 原来只认「路径指向的文件不存在」，升级后装了新版、旧包还留在原地的情况它一声不响，三个配置式客户端始终拿着旧包里的六个工具，界面上却显示「已接入」。现在两种都算要修，`mcp-repair --dry-run` 先列清单。本机实际扫出 5 个：Codex、WorkBuddy、Kimi 指着 `~/Applications` 里 18:39 的旧包，Claude Code 和 OpenCode 指着 `.build` 里的调试产物，都只拿到六个工具。用例覆盖「指旧包要修」「已指当前不动」「两种问题并存各自只算一次」。`bash scripts/build.sh` 398 项通过、0 失败。
+
 2026-10-26 MCP 接入面板。以前接 MCP 要挨个翻文档改配置文件，六个客户端六个位置、三种写法，Claude Code 还有顶层和按项目两层登记，配错了只有等 agent 调不通才发现，而那已经是另一个会话里的事了。现在工具栏「MCP 接入」一屏看完：本机六个客户端 6/6 可用，五行握手各拿到 6 个工具，DeepSeek Harness 显示插件已装。`mcp-status` 同样六行、退出码 0，`--json` 的字段能被 `json.load` 直接读。
 
 写入这块花的力气最多，因为同一个文件里躺着别人家的配置。WorkBuddy 的 `mcp.json` 有 99 条别的登记，测试里 40 条旁证逐字节比对，接入再移除后和原文完全一致；Codex 那边 TOML 的注释、别的 `[mcp_servers.*]` 段也一字不动。中途发现 `JSONSerialization` 会放过尾逗号（`{"a": 1,}` 返回 true），照旧校验等于没校验，带尾逗号做文本手术会切错位置，于是换成手写的递归下降校验，逗号后直接闭合就拒。并发也守住了：写入前后比对修改时间和大小，中间被别的工具插一手就回滚并提示重试，测试用写入钩子在备份之后、落盘之前精确插一刀，确认没覆盖别人写的内容、也没丢备份。顺带修了测试自身的毛病：早先只隔离 `ONBOARD_HOME`，假备份其实写进了真实的 `~/.agent-history/backups/`，现在两个环境变量都隔离。
@@ -255,8 +283,5 @@ bash scripts/build.sh
 ## 许可证
 
 Apache License 2.0，见 [LICENSE](LICENSE)。只依赖系统框架与 libsqlite3，没有第三方库。
- ## 验证记录
-
-- 2026-10-26 应用图标最终与界面统一。侧栏左上角本来就是「Theme.accent 渐变圆角方块 + 白色 brain.head.profile 符号」，界面和 Dock 两个记忆点理应一致，所以图标改成同一副：4096 画布上先画和侧栏一致的 45 度渐变底，再用 AppKit 渲染同一个 SF Symbol 白色符号缩放到 62% 居中，缩到 1024 后打包 icns。make_icon.py 之外新增 make_icon.swift 作为符号渲染一环，整套仍可一键重生成。235 项测试全过、0 失败。
 
 

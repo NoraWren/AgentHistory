@@ -1060,6 +1060,28 @@ enum MCPOnboarder {
         }
     }
 
+    /// 收集「连得上但登记的不是当前这份程序」的客户端。
+    /// 升了级却还指着旧包时，握手只会拿到旧包里的工具，光看「已接入」发现不了。
+    static func outdatedRegistrations(reports: [MCPClientReport],
+                                      binary: String = MCPTargetRegistry.currentBinary()) -> [FixItem] {
+        let current = URL(fileURLWithPath: binary).resolvingSymlinksInPath().path
+        return reports.compactMap { report in
+            guard case let .connected(_, registered, _, _) = report.state else { return nil }
+            let resolved = URL(fileURLWithPath: registered).resolvingSymlinksInPath().path
+            guard resolved != current else { return nil }
+            return FixItem(target: report.target, oldBinary: registered)
+        }
+    }
+
+    /// 一次要修的都在这里：路径失效的和版本落后的。同一个客户端只出现一次。
+    static func repairable(reports: [MCPClientReport],
+                           binary: String = MCPTargetRegistry.currentBinary()) -> [FixItem] {
+        let broken = staleRegistrations(reports: reports)
+        let seen = Set(broken.map { $0.target.kind })
+        return broken + outdatedRegistrations(reports: reports, binary: binary)
+            .filter { !seen.contains($0.target.kind) }
+    }
+
     static func repair(items: [FixItem], binary: String = MCPTargetRegistry.currentBinary()) -> [MCPActionResult] {
         items.map { item in
             do {

@@ -52,6 +52,14 @@ struct RootView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
+                    model.showMemoryList = true
+                } label: {
+                    Label("记忆", systemImage: "books.vertical")
+                }
+                .help("看交接包、汇编与已记下的结论")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
                     model.showStatus = true
                 } label: {
                     Label("来源状态", systemImage: "gauge.medium")
@@ -85,6 +93,15 @@ struct RootView: View {
         }
         .sheet(isPresented: Binding(get: { model.showOnboarding }, set: { model.showOnboarding = $0 })) {
             MCPOnboardingView(model: model.onboarding)
+        }
+        .sheet(isPresented: Binding(get: { model.showMemoryList }, set: { model.showMemoryList = $0 })) {
+            MemoryListView(model: model)
+        }
+        .sheet(isPresented: Binding(get: { model.showMemoryPreview },
+                                    set: { model.showMemoryPreview = $0 })) {
+            if let doc = model.memoryPreview {
+                MemoryPreviewView(doc: doc)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .focusSearch)) { _ in
             model.searchFocused = true
@@ -242,7 +259,7 @@ struct ThreadListView: View {
                     .font(.system(size: 12))
                     .onSubmit { model.runSearch() }
                 if !model.searchText.isEmpty {
-                    Button { model.searchText = ""; model.searchHits = [] } label: {
+                    Button { model.searchText = ""; model.searchHits = []; model.searchRan = false } label: {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
                     }.buttonStyle(.plain)
                 }
@@ -257,13 +274,14 @@ struct ThreadListView: View {
 
             if !model.searchHits.isEmpty {
                 HStack {
-                    Text("找到 \(model.searchHits.count) 个会话").font(.system(size: 9)).foregroundStyle(.secondary)
+                    Text(resultSummary).font(.system(size: 9)).foregroundStyle(.secondary)
                     if model.searchHits.contains(where: { $0.copyCount > 0 }) {
                         Text("已合并副本").font(.system(size: 9)).foregroundStyle(.tertiary)
                     }
                     Spacer()
                     Button("导出结果") { model.exportSearchResults() }
                         .buttonStyle(.link).font(.system(size: 10))
+                        .disabled(model.searchHits.allSatisfy(\.isMemory))
                 }
                 .padding(.horizontal, 14)
                 .padding(.bottom, 4)
@@ -289,7 +307,11 @@ struct ThreadListView: View {
                                         .font(.system(size: 11))
                                         .lineLimit(2)
                                     HStack(spacing: 6) {
-                                        Pill(text: hit.sourceKind.displayName, color: Theme.source(hit.sourceKind))
+                                        if let kind = hit.memoryKind {
+                                            Pill(text: kind.displayName, color: Theme.memory(kind))
+                                        } else {
+                                            Pill(text: hit.sourceKind.displayName, color: Theme.source(hit.sourceKind))
+                                        }
                                         Text(shortTime(hit.createdAt)).font(.system(size: 9)).foregroundStyle(.tertiary)
                                     }
                                 }
@@ -303,9 +325,25 @@ struct ThreadListView: View {
                                         in: RoundedRectangle(cornerRadius: 8))
                             .padding(.horizontal, 6)
                             .contextMenu {
-                                Button("导出此会话") { model.exportThreads([hit.threadId]) }
+                                if hit.isMemory {
+                                    Button("查看正文") { model.openMemoryHit(hit) }
+                                } else {
+                                    Button("导出此会话") { model.exportThreads([hit.threadId]) }
+                                }
                             }
                         }
+                    } else if model.searchRan {
+                        // 搜过了就照实说没有，别退回会话列表冒充结果。
+                        VStack(spacing: 6) {
+                            Text("没有命中").font(.system(size: 12, weight: .medium))
+                            Text(model.searchScope == .threads
+                                 ? "会话里没有这个词。范围切到「记忆」可以再查交接包、汇编和结论。"
+                                 : "这个范围里没有这个词，换个说法或把范围切到「全部」再试。")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.horizontal, 18)
+                        .padding(.top, 40)
                     } else {
                         ForEach(model.threads) { t in
                             ThreadRowView(thread: t, selected: model.selectedThreadId == t.id)
@@ -341,8 +379,30 @@ struct ThreadListView: View {
         .background(Color(nsColor: .underPageBackgroundColor).opacity(0.35))
     }
 
+    /// 结果抬头：两类命中分开报数，别把记忆和会话加成一个数。
+    private var resultSummary: String {
+        let memory = model.searchHits.filter(\.isMemory).count
+        let threads = model.searchHits.count - memory
+        if memory == 0 { return "找到 \(threads) 个会话" }
+        if threads == 0 { return "找到 \(memory) 条记忆" }
+        return "会话 \(threads) 个 · 记忆 \(memory) 条"
+    }
+
     private var filterBar: some View {
         HStack(spacing: 6) {
+            // 范围切换放最左：先定查哪一类，再谈别的筛选。
+            Picker("", selection: Binding(get: { model.searchScope },
+                    set: { model.searchScope = $0 })) {
+                ForEach(SearchScope.allCases, id: \.self) { scope in
+                    Text(scope.displayName).tag(scope)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 150)
+            .controlSize(.mini)
+            .help("会话只查聊天记录，记忆查交接包、汇编和结论")
+            Divider().frame(height: 12)
             Toggle(isOn: Binding(get: { model.mergeCopies },
                                  set: { model.mergeCopies = $0; model.reload() })) {
                 Text("合并副本").font(.system(size: 10))

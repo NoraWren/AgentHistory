@@ -1271,6 +1271,10 @@ struct HandoffWriter {
             try md.write(toFile: file, atomically: true, encoding: .utf8)
             try WriteSupport.record(store: store, plan: plan, threadId: threadId, status: "transferred",
                                     detail: file, target: targetKey)
+            // 界面导出的交接包同样要能被检索到，否则「导出了但搜不到」还是同一个坑。
+            _ = try? store.upsertMemoryFile(kind: .handoff, path: file, title: title, body: md,
+                                            threadId: threadId, meta: "目标 \(targetKey)",
+                                            todo: "在目标客户端继续上述工作")
             written += 1; artifacts.append(file)
             progress(0.60 + 0.30 * Double(i + 1) / Double(max(payloads.count, 1)), "生成交接包")
         }

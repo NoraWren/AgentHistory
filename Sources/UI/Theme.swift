@@ -28,6 +28,15 @@ enum Theme {
         case .deepseek: return "waveform"
         }
     }
+
+    /// 记忆三类的颜色：交接包蓝、汇编青、结论橙。与会话来路区分开，扫一眼就知道这行不是聊天。
+    static func memory(_ kind: MemoryKind) -> Color {
+        switch kind {
+        case .handoff: return Color(red: 0.310, green: 0.520, blue: 0.940)
+        case .digest: return Color(red: 0.145, green: 0.640, blue: 0.600)
+        case .fact: return Color(red: 0.870, green: 0.520, blue: 0.180)
+        }
+    }
 }
 
 struct Pill: View {

@@ -117,8 +117,34 @@ struct SearchHit: Identifiable {
     var groupHits: Int = 1
     /// 短语命中 / 宽松命中
     var matchKind: String = "短语"
+    /// 记忆类命中时才有值：来自哪类记忆、哪份文档。会话条目命中一律为 nil。
+    var memoryKind: MemoryKind? = nil
+    var memoryId: String? = nil
+    /// 记忆文档在磁盘上的位置，空表示只存在库里（例如结论）。
+    var memoryPath: String = ""
 
     var targetThreadId: String { hitThreadId ?? threadId }
+    var isMemory: Bool { memoryKind != nil }
+    /// 结果行上的类别前缀。「会话」与记忆三类同列时可一眼分清。
+    var kindLabel: String { memoryKind?.displayName ?? "会话" }
+}
+
+/// 检索范围。默认只看会话条目，既有调用方的结果一个字都不变。
+enum SearchScope: String, CaseIterable {
+    case threads
+    case memory
+    case all
+
+    var displayName: String {
+        switch self {
+        case .threads: return "会话"
+        case .memory: return "记忆"
+        case .all: return "全部"
+        }
+    }
+
+    var includesThreads: Bool { self != .memory }
+    var includesMemory: Bool { self != .threads }
 }
 
 struct SearchOptions {
@@ -129,6 +155,7 @@ struct SearchOptions {
     var onlyUser: Bool = false
     var limit: Int = 60
     var mergeCopies: Bool = true
+    var scope: SearchScope = .threads
 }
 
 struct LineageMember: Identifiable {

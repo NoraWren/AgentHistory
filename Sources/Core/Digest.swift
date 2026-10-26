@@ -693,6 +693,7 @@ enum DigestRunner {
         result.markdown = body
         if result.note.isEmpty { result.note = note }
         result.path = save(store: store, options: options, plan: plan, markdown: body)
+        store.indexDigest(path: result.path, plan: plan, markdown: body)
         return result
     }
 
@@ -808,6 +809,21 @@ enum DigestRunner {
         do { try markdown.write(toFile: path, atomically: true, encoding: .utf8) }
         catch { return "" }
         return path
+    }
+}
+
+// MARK: - 汇编产物进索引
+
+extension Store {
+    /// 汇编落盘后补一次索引登记。单独提出来，是因为 Digest.save 是静态方法、
+    /// 拿不到 store 之外的上下文，调用点只要一行就能接上。
+    /// 汇编由多个会话汇总而成，没有单一来源会话，thread_id 留空是如实的。
+    func indexDigest(path: String, plan: DigestPlan, markdown: String) {
+        guard !path.isEmpty else { return }
+        let title = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        let meta = "覆盖 \(plan.dayCount) 天、\(plan.threadCount) 个会话、\(plan.turnCount) 轮"
+        _ = try? upsertMemoryFile(kind: .digest, path: path, title: title,
+                                  body: markdown, meta: meta)
     }
 }
 

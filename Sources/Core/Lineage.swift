@@ -112,8 +112,12 @@ enum LineageBuilder {
         }
 
         var evidence: [CopyEvidence] = []
+        // 只把同步传输记录当血缘证据。agent 写的交接包与传输记录共表，
+        // 早先整表读进来，那类行一律被判成「交接包不是原生会话」跳过，白白稀释了统计。
         let handoffs: [(threadId: String, target: String, payload: String)] = try store.db.query(
-            "SELECT thread_id, target, payload FROM handoffs") { ($0.text(0), $0.text(1), $0.text(2)) }
+            "SELECT thread_id, target, payload FROM handoffs WHERE status='transferred'") {
+                ($0.text(0), $0.text(1), $0.text(2))
+            }
 
         for h in handoffs {
             guard let rule = targetRule(h.target) else {

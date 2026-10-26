@@ -36,7 +36,7 @@ final class MCPOnboardingModel: ObservableObject {
     /// 只算「本来能用却用不了」的，未接入是常态，别拿来吓人。
     var failures: [MCPClientReport] { reports.filter { $0.state.isFailure } }
 
-    var staleCount: Int { MCPOnboarder.staleRegistrations(reports: reports).count }
+    var staleCount: Int { MCPOnboarder.repairable(reports: reports).count }
 
     var lastCheckedText: String {
         guard let lastChecked else { return "还没检查" }
@@ -50,7 +50,7 @@ final class MCPOnboardingModel: ObservableObject {
         if reports.isEmpty { return checking ? "正在检查…" : "还没检查" }
         var line = "\(usableCount)/\(reports.count) 个客户端能调用本服务"
         if !failures.isEmpty { line += "，" + String(failures.count) + " 个连不上" }
-        if staleCount > 0 { line += "，" + String(staleCount) + " 个路径失效" }
+        if staleCount > 0 { line += "，" + String(staleCount) + " 个登记要改回当前程序" }
         return line
     }
 
@@ -121,13 +121,13 @@ final class MCPOnboardingModel: ObservableObject {
         }
     }
 
-    /// 一次把路径失效的都改回当前这份程序。
+    /// 一次把登记改回当前这份程序：路径失效的与版本落后的都算。
     func repairAll() {
-        let items = MCPOnboarder.staleRegistrations(reports: reports)
-        guard !items.isEmpty else { notice = "没有失效路径，不需要修"; return }
+        let items = MCPOnboarder.repairable(reports: reports)
+        guard !items.isEmpty else { notice = "登记都对得上当前程序，不需要修"; return }
         busy = nil
         problem = nil
-        notice = "正在修 " + String(items.count) + " 个客户端的路径"
+        notice = "正在把 " + String(items.count) + " 个客户端改回当前程序"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let results = MCPOnboarder.repair(items: items)
             DispatchQueue.main.async {
@@ -393,7 +393,7 @@ struct MCPOnboardingView: View {
                 Text("最近检查 " + model.lastCheckedText).font(.system(size: 10)).foregroundStyle(.tertiary)
                 Spacer()
                 if model.staleCount > 0 {
-                    Button("修复全部失效路径") { model.repairAll() }
+                    Button("改回当前程序") { model.repairAll() }
                         .controlSize(.small)
                 }
                 Button("关闭") { dismiss() }

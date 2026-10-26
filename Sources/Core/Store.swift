@@ -65,6 +65,18 @@ final class Store {
             role TEXT NOT NULL DEFAULT 'copy', relation TEXT NOT NULL DEFAULT 'inferred',
             direction TEXT NOT NULL DEFAULT '', target_ref TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0);
+        -- 记忆类内容单独占一张表：交接包、汇编、结论的召回方式完全一样，
+        -- 塞进 items 里造伪会话会污染会话数、条目数、项目列表和血缘重建。
+        CREATE TABLE IF NOT EXISTS memory_docs(
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
+            thread_id TEXT NOT NULL DEFAULT '', item_ordinal INTEGER NOT NULL DEFAULT -1,
+            category TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '',
+            meta TEXT NOT NULL DEFAULT '', todo TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
+            superseded_by TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0,
+            generated_at INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_threads_source ON threads(source_id, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread_id, ordinal);
@@ -77,9 +89,17 @@ final class Store {
         CREATE INDEX IF NOT EXISTS idx_links_thread ON thread_links(thread_id);
         CREATE INDEX IF NOT EXISTS idx_links_family ON thread_links(family_id);
         CREATE INDEX IF NOT EXISTS idx_families_rep ON thread_families(representative_thread_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_kind ON memory_docs(kind, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_thread ON memory_docs(thread_id, kind);
+        -- 文件类按「类别加路径」唯一，补录才敢反复跑；结论按「会话加指纹」唯一，同一句话写两遍只留一条。
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_path ON memory_docs(kind, path) WHERE path<>'';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_fact ON memory_docs(thread_id, content_hash) WHERE kind='fact';
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_docs_fts USING fts5(seg, content='', contentless_delete=1);
         """)
         try db.run("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','2')")
         try backfillTurns()
+        // 交接包与汇编早于索引功能产生，第一次启动补一遍，之后就靠手动触发。
+        backfillMemoryIfNeeded()
     }
 
     /// 老库里条目没有轮次归属（`turns` 为空、`items.turn_id` 全空），

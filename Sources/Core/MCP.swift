@@ -142,6 +142,8 @@ private let toolDefinitions: [[String: Any]] = [
         "days": ["type": "integer", "description": "只看最近 N 天"],
         "only_user": ["type": "boolean", "description": "只看用户提问"],
         "merge_copies": ["type": "boolean", "default": true, "description": "是否合并族内副本"],
+        "scope": ["type": "string", "enum": ["threads", "memory", "all"], "default": "threads",
+                  "description": "检索范围：threads 只查会话条目，memory 只查交接包、汇编与结论，all 两者一起查"],
         "limit": ["type": "integer", "default": 20]],
         "required": ["query"]]],
     ["name": "get_thread_context",
@@ -164,7 +166,7 @@ private let toolDefinitions: [[String: Any]] = [
      "description": "库的规模：会话数、条目数、项目数、今天新增、库文件大小。查之前先看一眼，好决定要不要加时间范围、limit 给多少",
      "inputSchema": ["type": "object", "properties": [:]]],
     ["name": "append_handoff",
-     "description": "写入一份交接包，供另一个客户端接手",
+     "description": "写入一份交接包，供另一个客户端接手。写入后立刻可被 recall 检索、可被 get_handoff 取回",
      "inputSchema": ["type": "object", "properties": [
         "thread_id": ["type": "string"],
         "title": ["type": "string"],
@@ -172,6 +174,41 @@ private let toolDefinitions: [[String: Any]] = [
         "todos": ["type": "string"],
         "target": ["type": "string"]],
         "required": ["title", "summary"]]],
+    ["name": "remember",
+     "description": "记下一条结论，供以后所有客户端召回。类别只收决策、偏好、事实；给出了会话 ID 与条目序号才算有出处，写错的可用 forget 作废，被新结论推翻的可指定取代哪一条",
+     "inputSchema": ["type": "object", "properties": [
+        "body": ["type": "string", "description": "结论正文，一句话说清"],
+        "category": ["type": "string", "enum": ["决策", "偏好", "事实"],
+                     "description": "决策是定下来的做法，偏好是使用者的习惯，事实是查证过的情况"],
+        "thread_id": ["type": "string", "description": "出处会话 ID，能对上就填"],
+        "item_ordinal": ["type": "integer", "description": "出处条目在会话里的序号"],
+        "supersedes": ["type": "string", "description": "被这条结论取代的旧结论 ID"]],
+        "required": ["body", "category"]]],
+    ["name": "recall",
+     "description": "检索记忆：交接包、汇编与结论。不给关键词时按时间倒序列出，默认不返回已作废与已被取代的条目",
+     "inputSchema": ["type": "object", "properties": [
+        "query": ["type": "string", "description": "关键词，支持中文片段；留空则按时间列出"],
+        "kind": ["type": "string", "enum": ["handoff", "digest", "fact"],
+                 "description": "只看某一类记忆"],
+        "thread_id": ["type": "string", "description": "只看这个会话产出的记忆"],
+        "include_inactive": ["type": "boolean", "default": false,
+                             "description": "是否连已作废、已被取代的一起返回"],
+        "limit": ["type": "integer", "default": 20]]]],
+    ["name": "forget",
+     "description": "作废一条记错的结论。条目与正文保留，只是默认不再被召回",
+     "inputSchema": ["type": "object", "properties": [
+        "id": ["type": "string", "description": "结论 ID"]],
+        "required": ["id"]]],
+    ["name": "list_handoffs",
+     "description": "列出 agent 写过的交接包，按时间倒序。同步留下的传输记录不计入，独立报个数",
+     "inputSchema": ["type": "object", "properties": [
+        "thread_id": ["type": "string", "description": "只看这个会话的交接包"],
+        "limit": ["type": "integer", "default": 20]]]],
+    ["name": "get_handoff",
+     "description": "按标识取回一份交接包的全文：正文、待办、目标客户端、来源会话与写入时间",
+     "inputSchema": ["type": "object", "properties": [
+        "id": ["type": "string", "description": "交接包 ID"]],
+        "required": ["id"]]],
 ]
 
 private func callTool(store: Store, name: String, arguments: [String: Any]) -> [String: Any] {
@@ -208,6 +245,15 @@ private func callTool(store: Store, name: String, arguments: [String: Any]) -> [
         options.limit = limit
         options.onlyUser = arguments["only_user"] as? Bool ?? false
         options.mergeCopies = arguments["merge_copies"] as? Bool ?? true
+        // 范围写错要当场说，不能悄悄按默认值查一遍：调用方以为查了记忆，
+        // 结果只拿到会话，会以为库里没有这条结论。
+        if let raw = arguments["scope"] as? String, !raw.isEmpty {
+            guard let scope = SearchScope(rawValue: raw) else {
+                let allowed = SearchScope.allCases.map(\.rawValue).joined(separator: " / ")
+                return textResult("scope 只认这些值：\(allowed)", isError: true)
+            }
+            options.scope = scope
+        }
         if let raw = arguments["days"], !(raw is NSNull) {
             guard let days = raw as? Int else {
                 return textResult("days 要写成整数", isError: true)
@@ -228,13 +274,25 @@ private func callTool(store: Store, name: String, arguments: [String: Any]) -> [
             var lines: [String] = []
             var used = 0
             for h in hits {
-                let line = "[\(h.sourceKind.displayName)] \(h.threadTitle)（\(h.matchKind)命中，族内\(h.groupHits)处\(h.copyCount > 0 ? "，另有\(h.copyCount)处副本" : "")）\n\(h.text.replacingOccurrences(of: "\n", with: " ").prefix(200))\nthread_id=\(h.threadId)"
+                let line = memoryLine(h) ?? threadLine(h)
                 if used + line.count > outputBudget, !lines.isEmpty { break }
                 lines.append(line)
                 used += line.count
             }
             guard !lines.isEmpty else { return textResult("没有命中") }
-            var header = "\(hits.count) 个会话命中"
+            var header: String
+            if options.scope == .threads {
+                header = "\(hits.count) 个会话命中"
+            } else {
+                // 记忆类命中不进族聚合，和会话命中分开计数，别把两类加到同一个数里。
+                let memoryCount = hits.filter(\.isMemory).count
+                let threadCount = hits.count - memoryCount
+                var parts: [String] = []
+                if threadCount > 0 { parts.append("会话 \(threadCount) 条") }
+                if memoryCount > 0 { parts.append("记忆 \(memoryCount) 条") }
+                header = parts.isEmpty ? "没有命中" : parts.joined(separator: " · ")
+                if !parts.isEmpty { header += "（范围：\(options.scope.displayName)）" }
+            }
             if lines.count < hits.count {
                 header += "，只列了前 \(lines.count) 条（字数上限），要更多请加 limit 或缩小范围"
             }
@@ -360,18 +418,140 @@ private func callTool(store: Store, name: String, arguments: [String: Any]) -> [
         let target = arguments["target"] as? String ?? ""
         let id = UUID().uuidString
         do {
-            try store.db.run("""
-            INSERT INTO handoffs(id,thread_id,target,created_at,title,summary,decisions,todos,files,status,payload)
-            VALUES(?,?,?,?,?,?,?,?,?, 'draft', '')
-            """, [id, threadId, target, Int64(Date().timeIntervalSince1970), title, summary, "", todos, ""])
             var md = "# \(title)\n\n\(summary)\n\n## 待办\n\n\(todos)\n"
             if !threadId.isEmpty, let t = try store.thread(id: threadId) {
                 md += "\n## 来源\n\n\(t.sourceKind.displayName) · \(t.projectPath)\n"
             }
             let file = store.root + "/handoffs/\(id).md"
+            // 先把文件写出来，再登记索引：索引里有、磁盘上没有的那种记录
+            // 检索时打开就是空白，不如让写入直接失败。
             try md.write(toFile: file, atomically: true, encoding: .utf8)
-            return textResult("已写入交接包 \(id)\n\(file)")
+            try store.db.run("""
+            INSERT INTO handoffs(id,thread_id,target,created_at,title,summary,decisions,todos,files,status,payload)
+            VALUES(?,?,?,?,?,?,?,?,?, 'handoff', '')
+            """, [id, threadId, target, Int64(Date().timeIntervalSince1970), title, summary, "", todos, ""])
+            // 登记失败只影响检索，不该让调用方以为交接包没写成。
+            var note = ""
+            do {
+                _ = try store.upsertMemoryFile(kind: .handoff, path: file, title: title, body: md,
+                                               threadId: threadId,
+                                               meta: target.isEmpty ? "" : "目标 \(target)",
+                                               todo: todos)
+            } catch {
+                note = "\n交接包已写成，但没能登记进检索索引：\(error)"
+            }
+            return textResult("已写入交接包 \(id)\n\(file)" + note)
         } catch { return textResult("写入失败：\(error)", isError: true) }
+
+    case "remember":
+        let body = arguments["body"] as? String ?? ""
+        let category = arguments["category"] as? String ?? ""
+        let threadId = arguments["thread_id"] as? String ?? ""
+        let ordinal = arguments["item_ordinal"] as? Int ?? -1
+        let supersedes = arguments["supersedes"] as? String ?? ""
+        do {
+            let result = try store.rememberFact(body: body, category: category, threadId: threadId,
+                                                itemOrdinal: ordinal, supersedes: supersedes)
+            if result.duplicate {
+                return textResult("这条结论已经记过，ID \(result.id)")
+            }
+            var line = "已记下结论 \(result.id)"
+            if threadId.isEmpty {
+                line += "\n没有给出处会话，这条会标为无出处"
+            } else {
+                line += "\n出处：\(threadId)\(ordinal >= 0 ? " 第 \(ordinal) 条" : "")"
+            }
+            if !supersedes.isEmpty { line += "\n已取代 \(supersedes)" }
+            return textResult(line)
+        } catch { return textResult("\(error)", isError: true) }
+
+    case "recall":
+        let query = (arguments["query"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawKind = arguments["kind"] as? String ?? ""
+        var kind: MemoryKind? = nil
+        if !rawKind.isEmpty {
+            guard let k = MemoryKind(rawValue: rawKind) else {
+                let allowed = MemoryKind.allCases.map(\.rawValue).joined(separator: " / ")
+                return textResult("kind 只认这些值：\(allowed)", isError: true)
+            }
+            kind = k
+        }
+        let threadId = arguments["thread_id"] as? String ?? ""
+        let includeInactive = arguments["include_inactive"] as? Bool ?? false
+        let limit = min(max(arguments["limit"] as? Int ?? 20, 1), 100)
+        do {
+            let docs = query.isEmpty
+                ? try store.listMemory(kind: kind, threadId: threadId,
+                                       includeInactive: includeInactive, limit: limit)
+                : try store.searchMemory(query, kind: kind,
+                                         threadId: threadId.isEmpty ? nil : threadId,
+                                         includeInactive: includeInactive, limit: limit).map(\.doc)
+            guard !docs.isEmpty else {
+                if !query.isEmpty { return textResult("没有命中") }
+                return textResult(threadId.isEmpty ? "库里还没有记忆" : "这个会话没有产出的记忆")
+            }
+            let budget = 16_000
+            var lines: [String] = []
+            var used = 0
+            for d in docs {
+                let line = docBlock(d)
+                if used + line.count > budget, !lines.isEmpty { break }
+                lines.append(line)
+                used += line.count
+            }
+            var header = "\(docs.count) 条记忆"
+            if lines.count < docs.count {
+                header += "，只列了前 \(lines.count) 条（字数上限），要更多请加 limit"
+            }
+            return textResult(header + "\n\n" + lines.joined(separator: "\n\n"))
+        } catch { return textResult("读取失败：\(error)", isError: true) }
+
+    case "forget":
+        let id = arguments["id"] as? String ?? ""
+        guard !id.isEmpty else { return textResult("缺少 id", isError: true) }
+        do {
+            guard let doc = try store.voidFact(id: id) else {
+                let current = try store.memoryDoc(id: id)
+                return textResult("这条结论已经是「\(current?.statusLabel ?? "非有效")」状态，没有改动")
+            }
+            return textResult("已作废 \(id)：\(doc.title)\n正文与出处保留，默认不再被召回")
+        } catch { return textResult("\(error)", isError: true) }
+
+    case "list_handoffs":
+        do {
+            let threadId = arguments["thread_id"] as? String ?? ""
+            let limit = min(max(arguments["limit"] as? Int ?? 20, 1), 100)
+            let docs = try store.handoffDocs(threadId: threadId.isEmpty ? nil : threadId, limit: limit)
+            let transfers = try store.transferRecordCount()
+            let note = transfers > 0 ? "\n另有 \(transfers) 条同步传输记录未计入" : ""
+            guard !docs.isEmpty else {
+                return textResult("还没有 agent 写过的交接包" + note)
+            }
+            let lines = docs.map { d -> String in
+                "\(d.title)  \(stamp(d.createdAt))\(d.threadId.isEmpty ? "" : "  会话 \(d.threadId)")\n  id=\(d.id)"
+            }
+            return textResult("\(docs.count) 份交接包" + note + "\n\n" + lines.joined(separator: "\n"))
+        } catch { return textResult("读取失败：\(error)", isError: true) }
+
+    case "get_handoff":
+        let id = arguments["id"] as? String ?? ""
+        guard !id.isEmpty else { return textResult("缺少 id", isError: true) }
+        do {
+            guard let doc = try store.memoryDoc(id: id), doc.kind == .handoff else {
+                return textResult("找不到交接包 \(id)", isError: true)
+            }
+            var header = "# \(doc.title)\n"
+            if !doc.meta.isEmpty { header += "\(doc.meta)\n" }
+            header += "写入时间：\(stamp(doc.createdAt))\n"
+            if !doc.threadId.isEmpty {
+                let exists = try store.thread(id: doc.threadId) != nil
+                header += exists ? "来源会话：\(doc.threadId)\n" : "来源会话：\(doc.threadId)（库里已不存在）\n"
+            }
+            if !doc.path.isEmpty, !FileManager.default.fileExists(atPath: doc.path) {
+                header += "文件已不在磁盘上，以下是索引里保存的正文\n"
+            }
+            return textResult(header + "\n" + doc.body)
+        } catch { return textResult("读取失败：\(error)", isError: true) }
 
     default:
         return textResult("未知工具 \(name)", isError: true)
