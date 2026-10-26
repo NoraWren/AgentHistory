@@ -197,8 +197,8 @@ private let toolDefinitions: [[String: Any]] = [
     ["name": "forget",
      "description": "作废一条记错的结论。条目与正文保留，只是默认不再被召回",
      "inputSchema": ["type": "object", "properties": [
-        "id": ["type": "string", "description": "结论 ID"]],
-        "required": ["id"]]],
+        "id": ["type": "string", "description": "结论 ID，也就是检索结果里的 memory_id"],
+        "memory_id": ["type": "string", "description": "结论 ID 的另一种写法，与 id 等价"]]]],
     ["name": "list_handoffs",
      "description": "列出 agent 写过的交接包，按时间倒序。同步留下的传输记录不计入，独立报个数",
      "inputSchema": ["type": "object", "properties": [
@@ -207,11 +207,19 @@ private let toolDefinitions: [[String: Any]] = [
     ["name": "get_handoff",
      "description": "按标识取回一份交接包的全文：正文、待办、目标客户端、来源会话与写入时间",
      "inputSchema": ["type": "object", "properties": [
-        "id": ["type": "string", "description": "交接包 ID"]],
-        "required": ["id"]]],
+        "id": ["type": "string", "description": "交接包 ID，也就是检索结果里的 memory_id"],
+        "memory_id": ["type": "string", "description": "交接包 ID 的另一种写法，与 id 等价"]]]],
 ]
 
 private func callTool(store: Store, name: String, arguments: [String: Any]) -> [String: Any] {
+    // recall 的结果行里写的是 memory_id=，agent 顺手把这个字段名传回来也会发生。
+    // 两种写法都收，免得它照着上一轮输出复制一个参数名，却被回一句「缺少 id」。
+    func memoryArgumentID(_ args: [String: Any]) -> String {
+        for key in ["id", "memory_id", "memoryId"] {
+            if let value = args[key] as? String, !value.isEmpty { return value }
+        }
+        return ""
+    }
     switch name {
     case "search_threads":
         let query = arguments["query"] as? String ?? ""
@@ -453,9 +461,11 @@ private func callTool(store: Store, name: String, arguments: [String: Any]) -> [
             let result = try store.rememberFact(body: body, category: category, threadId: threadId,
                                                 itemOrdinal: ordinal, supersedes: supersedes)
             if result.duplicate {
-                return textResult("这条结论已经记过，ID \(result.id)")
+                // 标识统一带 memory_id= 前缀：agent 拿它当下一步 recall / forget 的入参，
+                // 回执格式得跟检索结果一致，否则还要在自然语言里再抠一遍。
+                return textResult("这条结论已经记过\nmemory_id=\(result.id)")
             }
-            var line = "已记下结论 \(result.id)"
+            var line = "已记下结论\nmemory_id=\(result.id)"
             if threadId.isEmpty {
                 line += "\n没有给出处会话，这条会标为无出处"
             } else {
@@ -507,7 +517,7 @@ private func callTool(store: Store, name: String, arguments: [String: Any]) -> [
         } catch { return textResult("读取失败：\(error)", isError: true) }
 
     case "forget":
-        let id = arguments["id"] as? String ?? ""
+        let id = memoryArgumentID(arguments)
         guard !id.isEmpty else { return textResult("缺少 id", isError: true) }
         do {
             guard let doc = try store.voidFact(id: id) else {
@@ -534,7 +544,7 @@ private func callTool(store: Store, name: String, arguments: [String: Any]) -> [
         } catch { return textResult("读取失败：\(error)", isError: true) }
 
     case "get_handoff":
-        let id = arguments["id"] as? String ?? ""
+        let id = memoryArgumentID(arguments)
         guard !id.isEmpty else { return textResult("缺少 id", isError: true) }
         do {
             guard let doc = try store.memoryDoc(id: id), doc.kind == .handoff else {
