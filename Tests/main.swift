@@ -1471,6 +1471,31 @@ do {
     try? FileManager.default.removeItem(atPath: home)
 }
 
+print("MCP 接入：升了级还指着旧包也要修")
+do {
+    let home = NSTemporaryDirectory() + "ah-outdated-" + UUID().uuidString
+    let codex = MCPClientReport(target: MCPTargetRegistry.target(.codex, home: home),
+                                state: .connected(path: "/tmp/c.toml", binary: "/tmp/旧程序",
+                                                  location: "[mcp_servers.agent-history]",
+                                                  tools: ["search_threads"]),
+                                configPath: "/tmp/c.toml", checkedAt: Date())
+    let outdated = MCPOnboarder.outdatedRegistrations(reports: [codex], binary: "/bin/新程序")
+    check(outdated.count == 1, "登记的不是当前这份程序，要修")
+    check(outdated.first?.oldBinary == "/tmp/旧程序", "记下了旧路径")
+    check(MCPOnboarder.outdatedRegistrations(reports: [codex], binary: "/tmp/旧程序").isEmpty,
+          "已经指着当前程序就不用动")
+    check(MCPOnboarder.repairable(reports: [codex], binary: "/bin/新程序").count == 1,
+          "一个客户端只算一次")
+
+    let kimi = MCPClientReport(target: MCPTargetRegistry.target(.kimi, home: home),
+                               state: .connectFailed(path: "/tmp/k.json", binary: "/tmp/没了",
+                                                     reason: "文件不在", fixable: true),
+                               configPath: "/tmp/k.json", checkedAt: Date())
+    let merged = MCPOnboarder.repairable(reports: [kimi, codex], binary: "/bin/新程序")
+    check(merged.count == 2, "失效的和落后的各算一个")
+    check(Set(merged.map { $0.target.kind }) == [.codex, .kimi], "认出的正是这两台")
+}
+
 print("MCP 接入：Claude 多层登记")
 do {
     let root = NSTemporaryDirectory() + "agent-history-claude-" + UUID().uuidString
@@ -1545,6 +1570,177 @@ do {
     check(((removedParsed?["projects"] as? [String: Any])?["/tmp/b"] as? [String: Any])?["mcpServers"] != nil,
           "项目 b 那一层还在")
     try? FileManager.default.removeItem(atPath: root)
+}
+
+
+print("记忆召回")
+do {
+    let root = NSTemporaryDirectory() + "agent-history-memory-\(UUID().uuidString)"
+    let store = try Store(root: root)
+    // 迁移只加表，既有三张表一行都不能多也不能少。
+    let before = (threads: Int(try store.db.scalarInt("SELECT COUNT(*) FROM threads")),
+                  items: Int(try store.db.scalarInt("SELECT COUNT(*) FROM items")),
+                  handoffs: Int(try store.db.scalarInt("SELECT COUNT(*) FROM handoffs")))
+    _ = try Store(root: root)
+    let after = (threads: Int(try store.db.scalarInt("SELECT COUNT(*) FROM threads")),
+                 items: Int(try store.db.scalarInt("SELECT COUNT(*) FROM items")),
+                 handoffs: Int(try store.db.scalarInt("SELECT COUNT(*) FROM handoffs")))
+    check(before == after, "重复迁移不新增会话、条目与交接记录")
+    check(try store.db.scalarInt("SELECT COUNT(*) FROM memory_docs") == 0,
+          "空库迁移后有记忆表且没有内容")
+
+    // 会话在前，结论才有出处可挂。
+    let threadId = try store.upsertThread(ThreadInput(
+        sourceId: "codex", nativeId: "m1", projectPath: "/tmp/mem",
+        title: "Nexus 升级讨论", createdAt: 1_700_000_000_000, updatedAt: 1_700_000_100_000,
+        model: "gpt", threadSource: "user", archived: false, preview: "升级"))
+    _ = try store.upsertItems(threadId: threadId, items: [
+        ItemInput(nativeId: "n1", ordinal: 1, itemType: "userMessage", role: "user",
+                  createdAt: 1_700_000_050_000, text: "Nexus 升级要不要我这边配合", rawJSON: "{}"),
+    ])
+
+    // 文件类记忆：按路径幂等，正文变了只更新不新增。
+    let handoffPath = root + "/handoffs/demo.md"
+    try "交接包正文：服务器归运维".write(toFile: handoffPath, atomically: true, encoding: .utf8)
+    let first = try store.upsertMemoryFile(kind: .handoff, path: handoffPath,
+                                          title: "demo", body: "交接包正文：服务器归运维",
+                                          threadId: threadId)
+    check(first.inserted, "首次登记交接包是新增")
+    let second = try store.upsertMemoryFile(kind: .handoff, path: handoffPath,
+                                           title: "demo", body: "交接包正文：服务器归运维",
+                                           threadId: threadId)
+    check(!second.inserted && second.id == first.id, "同一份文件再登记不算新增")
+    check(try store.db.scalarInt("SELECT COUNT(*) FROM memory_docs WHERE kind='handoff'") == 1,
+          "同一份文件只有一行")
+    _ = try store.upsertMemoryFile(kind: .handoff, path: handoffPath, title: "demo改",
+                                   body: "交接包正文：服务器由运维负责，别找开源组",
+                                   threadId: threadId)
+    check(try store.db.scalarInt("SELECT COUNT(*) FROM memory_docs WHERE kind='handoff'") == 1,
+          "正文改了还是同一行")
+    check(try store.searchMemory("开源组").count == 1, "改过的正文立刻能被记忆检索命中")
+
+    // 结论：三值类别、判重、取代、作废。
+    let decision = try store.rememberFact(body: "Nexus 升级是公司服务器的事，和开源项目没关系",
+                                          category: "决策", threadId: threadId, itemOrdinal: 1)
+    check(!decision.duplicate, "首次记结论不是重复")
+    let sameAgain = try store.rememberFact(body: "Nexus 升级是公司服务器的事，和开源项目没关系",
+                                           category: "决策", threadId: threadId)
+    check(sameAgain.duplicate && sameAgain.id == decision.id, "同一会话同一正文判为重复")
+    check(try store.db.scalarInt("SELECT COUNT(*) FROM memory_docs WHERE kind='fact'") == 1,
+          "重复写入只留一行")
+    let spaced = try store.rememberFact(body: "Nexus 升级是公司服务器的事， 和开源项目没关系。",
+                                        category: "决策", threadId: threadId)
+    check(spaced.duplicate, "多一个空格和句号仍算同一条")
+    do {
+        _ = try store.rememberFact(body: "随便写", category: "猜测", threadId: threadId)
+        check(false, "第四个类别应被拒绝")
+    } catch {
+        check("\(error)".contains("category"), "第四个类别给出允许值说明")
+    }
+    do {
+        _ = try store.rememberFact(body: "   ", category: "事实")
+        check(false, "空正文应被拒绝")
+    } catch { check(true, "空正文被拒绝") }
+    do {
+        _ = try store.rememberFact(body: String(repeating: "长", count: 4001), category: "事实")
+        check(false, "超长正文应被拒绝")
+    } catch { check(true, "超长正文被拒绝") }
+    check(try store.db.scalarInt("SELECT COUNT(*) FROM memory_docs WHERE kind='fact'") == 1,
+          "被拒的写入没有留下任何行")
+
+    let replacement = try store.rememberFact(body: "Nexus 归服务器运维，开源项目不跟",
+                                             category: "决策", threadId: threadId,
+                                             supersedes: decision.id)
+    let superseded = try store.memoryDoc(id: decision.id)
+    check(superseded?.status == "superseded" && superseded?.supersededBy == replacement.id,
+          "被取代的条目状态与指向都对")
+    check(superseded?.body.isEmpty == false, "被取代的条目正文还在")
+    let active = try store.searchMemory("开源项目")
+    check(active.allSatisfy { $0.doc.status == "active" }, "默认检索不返回被取代的条目")
+    let all = try store.searchMemory("开源项目", includeInactive: true)
+    check(all.count == 2, "勾上包含失效后两条都在")
+
+    do {
+        _ = try store.rememberFact(body: "再写一条", category: "事实", threadId: threadId,
+                                   supersedes: "不存在的标识")
+        check(false, "取代目标不存在应被拒绝")
+    } catch { check(true, "取代目标不存在时拒绝写入") }
+
+    _ = try store.voidFact(id: replacement.id)
+    check(try store.memoryDoc(id: replacement.id)?.status == "void", "作废只改状态")
+    check(try store.voidFact(id: replacement.id) == nil, "重复作废不报错也不改动")
+    check(try store.searchMemory("开源项目").isEmpty, "作废后默认检索不再返回")
+    do {
+        _ = try store.voidFact(id: first.id)
+        check(false, "交接包不能当作结论作废")
+    } catch { check(true, "交接包不能作废") }
+
+    // 按会话取回：交接包与结论都算这个会话的记忆，汇编不按会话归属。
+    let forThread = try store.memoryForThread(threadId)
+    check(forThread.contains { $0.kind == .handoff }, "按会话能取回交接包")
+    check(forThread.contains { $0.kind == .fact } == false, "作废的结论不出现在会话记忆里")
+
+    // 检索范围：默认只看会话，一个字都不变。
+    check(SearchOptions().scope == .threads, "检索范围默认是会话")
+    check(SearchScope.allCases.map(\.rawValue) == ["threads", "memory", "all"],
+          "范围只有会话、记忆、全部三值")
+    let digestPath = root + "/digests/2026-10-26-主题汇编.md"
+    try FileManager.default.createDirectory(atPath: root + "/digests", withIntermediateDirectories: true)
+    try "汇编正文：Nexus 归运维".write(toFile: digestPath, atomically: true, encoding: .utf8)
+    _ = try store.upsertMemoryFile(kind: .digest, path: digestPath, title: "2026-10-26-主题汇编",
+                                   body: "汇编正文：Nexus 升级归服务器运维，和开源项目分开")
+    let defaultHits = try store.search("运维")
+    check(defaultHits.allSatisfy { !$0.isMemory }, "默认范围不会混进记忆")
+    var memoryOnly = SearchOptions()
+    memoryOnly.scope = .memory
+    let memHits = try store.search("运维", options: memoryOnly)
+    check(memHits.count == 2 && memHits.allSatisfy(\.isMemory), "记忆范围只返回记忆")
+    check(memHits.allSatisfy { $0.memoryId?.isEmpty == false }, "记忆命中带 memory_id")
+    var everything = SearchOptions()
+    everything.scope = .all
+    let both = try store.search("Nexus", options: everything)
+    check(both.contains { $0.isMemory } && both.contains { !$0.isMemory },
+          "全部范围两类命中同列")
+    check(both.contains { $0.isMemory && $0.kindLabel == "汇编" }, "命中行带类别前缀")
+
+    // 会话命中把名额占满时，记忆不能一条都进不来，否则「全部」等于「只看会话」。
+    var tight = SearchOptions()
+    tight.scope = .all
+    tight.limit = 1
+    let tightHits = try store.search("Nexus", options: tight)
+    check(tightHits.count == 1, "上限收窄后只给一条")
+    check(tightHits.first?.isMemory == true, "名额再紧也要给记忆留出来")
+
+    var roomy = SearchOptions()
+    roomy.scope = .all
+    roomy.limit = 60
+    let roomyHits = try store.search("Nexus", options: roomy)
+    check(roomyHits.contains { $0.isMemory }, "会话很多时记忆仍然出现")
+    check(roomyHits.filter { $0.isMemory }.count <= 30, "记忆最多占一半名额")
+
+    // 补录：只认磁盘上还在的文件，跑第二遍全跳过。
+    let firstBackfill = try store.backfillMemory()
+    check(firstBackfill.added == 0 && firstBackfill.removed == 0,
+          "已经登记过的文件补录不重复")
+    try FileManager.default.removeItem(atPath: digestPath)
+    let cleaned = try store.backfillMemory()
+    check(cleaned.removed == 1, "磁盘上删掉的文件补录时清掉索引")
+    check(try store.searchMemory("分开").isEmpty, "清掉之后检索不到")
+    check(try store.memoryDoc(id: first.id) != nil, "没删的文件索引一直留着")
+
+    // 来源会话删掉后，结论仍能取回，并看得出出处没了。
+    try store.db.run("DELETE FROM threads WHERE id=?", [threadId])
+    let orphan = try store.memoryDoc(id: decision.id)
+    check(orphan?.threadId == threadId, "来源会话删了也带着原始会话标识")
+    check((try? store.thread(id: threadId)) == nil, "来源会话确实不在了")
+
+    let counts = try store.memoryCounts()
+    check(counts.handoffs == 1 && counts.facts == 0, "分类计数只数还能用的条目")
+
+    try? FileManager.default.removeItem(atPath: root)
+} catch {
+    print("  FAIL 记忆用例：\(error)")
+    failures += 1
 }
 
 

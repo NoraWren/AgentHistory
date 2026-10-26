@@ -41,6 +41,24 @@ final class AppModel: ObservableObject {
     @Published var currentTurn = 0
     @Published var searchText = ""
     @Published var searchHits: [SearchHit] = []
+    /// 这一轮检索到底跑没跑过。用来区分「还没搜」和「搜了没有」，
+    /// 后者不能退回会话列表——那看起来像搜索压根没生效。
+    @Published var searchRan = false
+    /// 检索范围。默认只看会话，和命令行、MCP 的默认一致。
+    @Published var searchScope: SearchScope = .threads {
+        didSet { if !searchText.isEmpty { runSearch() } }
+    }
+    /// 记忆命中的预览：文件还在就直接打开，不在就拿索引里的正文顶上。
+    @Published var memoryPreview: MemoryDoc?
+    @Published var showMemoryPreview = false
+    @Published var showMemoryList = false
+    // 记忆清单的状态。和别的页面一样放在 model 上，视图里不存状态：
+    // 这套构建没有 SwiftUI 宏插件，@State 编译不过。
+    @Published var memoryListKind: MemoryKind = .fact
+    @Published var memoryListCategory = ""
+    @Published var memoryListIncludeInactive = false
+    @Published var memoryListDocs: [MemoryDoc] = []
+    @Published var memoryListNote = ""
     @Published var filterSource: SourceKind?
     @Published var filterProject: String?
     @Published var mergeCopies = UserDefaults.standard.object(forKey: "mergeCopies") == nil
@@ -215,16 +233,72 @@ final class AppModel: ObservableObject {
 
     func runSearch() {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { searchHits = []; return }
+        guard !q.isEmpty else { searchHits = []; searchRan = false; return }
         var options = SearchOptions()
         options.sourceKind = filterSource
         options.projectPath = filterProject
         options.onlyUser = onlyUser
+        options.scope = searchScope
         if filterDays > 0 {
             options.since = Int64(Date().timeIntervalSince1970) * 1000 - Int64(filterDays) * 86_400_000
         }
-        do { searchHits = try store.search(q, options: options) }
-        catch { statusText = "搜索失败：\(error)"; searchHits = [] }
+        do { searchHits = try store.search(q, options: options); searchRan = true }
+        catch { statusText = "搜索失败：\(error)"; searchHits = []; searchRan = false }
+    }
+
+    /// 点开一条记忆命中。文件在就交给系统打开，文件没了就把索引里的正文拿出来看，
+    /// 不能点了没反应——那和「搜到了却是空的」是一回事。
+    func openMemoryHit(_ hit: SearchHit) {
+        guard let id = hit.memoryId else { return }
+        guard let doc = try? store.memoryDoc(id: id) else {
+            jumpNotice = "这条记忆已经不在库里：\(id)"
+            return
+        }
+        if !doc.path.isEmpty, FileManager.default.fileExists(atPath: doc.path) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: doc.path))
+            return
+        }
+        memoryPreview = doc
+        showMemoryPreview = true
+        if !doc.path.isEmpty {
+            jumpNotice = "文件 \(doc.path) 已不在磁盘上，显示的是索引里的正文"
+        }
+    }
+
+    func previewMemory(_ doc: MemoryDoc) {
+        memoryPreview = doc
+        showMemoryPreview = true
+    }
+
+    /// 作废一条结论。清单与检索结果一起失效，免得一边显示已作废、一边还能搜到。
+    func voidFact(_ id: String) {
+        do {
+            _ = try store.voidFact(id: id)
+            refreshMemoryList()
+            if !searchText.isEmpty { runSearch() }
+        } catch { statusText = "作废失败：\(error)" }
+    }
+
+    // MARK: - 记忆清单
+
+    func refreshMemoryList() {
+        do {
+            switch memoryListKind {
+            case .fact:
+                memoryListDocs = try store.facts(category: memoryListCategory,
+                                                 includeInactive: memoryListIncludeInactive)
+            case .handoff:
+                memoryListDocs = try store.handoffDocs()
+            case .digest:
+                memoryListDocs = try store.listMemory(kind: .digest, includeInactive: true,
+                                                      limit: 300)
+            }
+            memoryListNote = memoryListKind == .fact && memoryListIncludeInactive
+                ? "含已作废与已被取代的条目" : ""
+        } catch {
+            memoryListDocs = []
+            memoryListNote = "读取失败：\(error)"
+        }
     }
 
     func runSync() {
@@ -270,6 +344,8 @@ final class AppModel: ObservableObject {
 
     func openHit(_ hit: SearchHit) {
         jumpNotice = nil
+        // 记忆类命中没有会话可跳，走另一条路。
+        if hit.isMemory { openMemoryHit(hit); return }
         // 命中在代表会话上直接取；在副本上则先切到代表，避免误跳。
         let targetId = hit.threadId
         searchText = ""

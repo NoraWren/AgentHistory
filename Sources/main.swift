@@ -102,6 +102,19 @@ case "search":
             options.onlyUser = true
         case "--all":
             options.mergeCopies = false
+        case "--scope":
+            i += 1
+            // 写错范围不能悄悄退回只看会话：调用方以为查了记忆，得到的「没有命中」是假的。
+            if i < args.count, let scope = SearchScope(rawValue: args[i]) {
+                options.scope = scope
+            } else if i < args.count {
+                let allowed = SearchScope.allCases.map(\.rawValue).joined(separator: " / ")
+                FileHandle.standardError.write(Data("--scope \(args[i]) 不认识，只能用 \(allowed)\n".utf8))
+                exit(2)
+            } else {
+                FileHandle.standardError.write(Data("--scope 后面要跟 threads / memory / all\n".utf8))
+                exit(2)
+            }
         default:
             words.append(args[i])
         }
@@ -109,7 +122,7 @@ case "search":
     }
     let query = words.joined(separator: " ")
     guard !query.isEmpty else {
-        print("用法：AgentHistory search <关键词> [--source codex] [--project 路径] [--days 7] [--asked] [--all] [--limit 60]")
+        print("用法：AgentHistory search <关键词> [--source codex] [--project 路径] [--days 7] [--asked] [--all] [--scope threads|memory|all] [--limit 60]")
         exit(2)
     }
     let store = try makeStore()
@@ -118,11 +131,24 @@ case "search":
         var marks: [String] = [hit.matchKind]
         if hit.groupHits > 1 { marks.append("命中 \(hit.groupHits) 处") }
         if hit.copyCount > 0 { marks.append("另有 \(hit.copyCount) 处副本") }
-        print("[\(hit.sourceKind.displayName)] \(hit.threadTitle)  （\(marks.joined(separator: "·"))）")
-        print("  thread_id=\(hit.threadId)（命中在 \(hit.targetThreadId)）")
+        if hit.isMemory {
+            print("[\(hit.kindLabel)] \(hit.threadTitle)  （\(marks.joined(separator: "·"))）")
+            print("  memory_id=\(hit.memoryId ?? "")")
+        } else {
+            print("[\(hit.sourceKind.displayName)] \(hit.threadTitle)  （\(marks.joined(separator: "·"))）")
+            print("  thread_id=\(hit.threadId)（命中在 \(hit.targetThreadId)）")
+        }
         print("  \(hit.text.replacingOccurrences(of: "\n", with: " ").prefix(120))")
     }
     print("共 \(hits.count) 条")
+
+case "memory-backfill":
+    // 早于索引功能产生的交接包与汇编只能靠这一遍补进检索。
+    let store = try makeStore()
+    let report = try store.backfillMemory()
+    print("补录完成：新增 \(report.added) 份，跳过 \(report.skipped) 份，清掉 \(report.removed) 份失效索引")
+    let total = try store.db.scalarInt("SELECT COUNT(*) FROM memory_docs WHERE kind IN ('handoff','digest')")
+    print("索引里现在有 \(total) 份文件类记忆")
 
 case "rebuild-lineage":
     let store = try makeStore()
@@ -284,19 +310,26 @@ case "mcp-connect", "mcp-disconnect":
     }
 
 case "mcp-repair":
-    // 应用被挪过位置之后，登记里还是旧路径。这里一次改完，再握手确认。
+    // 应用被挪过位置、或者升了级却还指着旧包，登记里写的都不是当前这份程序。
+    // 这里一次改完，再握手确认。
+    let dryRun = args.contains("--dry-run")
     let reports = MCPOnboarding.inspectAll()
-    let items = MCPOnboarder.staleRegistrations(reports: reports)
+    let items = MCPOnboarder.repairable(reports: reports)
     guard !items.isEmpty else {
-        print("没有失效路径，不需要修")
+        print("登记都对得上当前程序（" + MCPTargetRegistry.currentBinary() + "），不需要修")
         for report in reports where report.state.isFailure {
             print("  仍有问题：\(report.displayName) —— \(report.reason)")
         }
         exit(0)
     }
-    print("有 \(items.count) 个登记指向了不存在的文件：")
+    print("有 \(items.count) 个登记要改回当前程序：")
     for item in items {
-        print("  \(item.target.displayName)：\(item.oldBinary)")
+        let exists = FileManager.default.fileExists(atPath: item.oldBinary)
+        print("  \(item.target.displayName)：\(item.oldBinary)" + (exists ? "（旧版本）" : "（文件已不在）"))
+    }
+    if dryRun {
+        print("这只是预演，没有改动任何文件。去掉 --dry-run 才会写入。")
+        exit(0)
     }
     let results = MCPOnboarder.repair(items: items)
     for result in results {
@@ -582,6 +615,8 @@ default:
       AgentHistory sync       同步全部可用来源
       AgentHistory stats      查看统计
       AgentHistory search     检索历史（支持 --source/--project/--days/--asked/--all）
+                              --scope threads|memory|all 连交接包、汇编与结论一起查
+      AgentHistory memory-backfill  把已有的交接包与汇编补进检索索引
       AgentHistory rebuild-lineage  重建副本血缘
       AgentHistory lineage    查看某会话的副本
       AgentHistory export     导出会话为 Markdown

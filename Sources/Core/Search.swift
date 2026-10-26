@@ -40,6 +40,63 @@ extension Store {
         options.limit = min(max(options.limit, 1), 200)
         let cleaned = TextTools.sanitize(query)
         guard !cleaned.isEmpty else { return [] }
+        var hits: [SearchHit] = []
+        switch options.scope {
+        case .threads:
+            hits = try threadHits(cleaned, options: options)
+        case .memory:
+            hits = try memoryHits(cleaned, options: options, limit: options.limit)
+        case .all:
+            hits = try mergedHits(cleaned, options: options)
+        }
+        return Array(hits.prefix(options.limit))
+    }
+
+    /// 记忆通道：交接包、汇编、结论各查各的表，命中后直接给出去。
+    /// 不做族聚合——这些文档没有副本概念，算进族里会把「另有 N 处副本」这个数算歪。
+    private func memoryHits(_ cleaned: String, options: SearchOptions, limit: Int) throws -> [SearchHit] {
+        guard limit > 0 else { return [] }
+        var hits: [SearchHit] = []
+        for m in try searchMemory(cleaned, limit: limit) {
+            // 记忆没有来源与项目归属，按时间筛仍然有意义，别的筛选一律不适用。
+            if let since = options.since, m.doc.createdAt < since { continue }
+            if let until = options.until, m.doc.createdAt >= until { continue }
+            hits.append(SearchHit(id: m.doc.id, threadId: m.doc.threadId,
+                                  threadTitle: m.doc.title, sourceKind: .codex,
+                                  itemType: m.doc.kind.rawValue, createdAt: m.doc.createdAt,
+                                  text: m.doc.body, ordinal: m.doc.itemOrdinal,
+                                  matchKind: m.matchKind, memoryKind: m.doc.kind,
+                                  memoryId: m.doc.id, memoryPath: m.doc.path))
+            if hits.count >= limit { break }
+        }
+        return hits
+    }
+
+    /// 范围设成全部：两条通道都给名额，谁没占满就把剩下的让给对方。
+    /// 早先是会话查满上限就不再补记忆，结果「全部」实际等于「只看会话」，
+    /// 一个常见词能凑够六十条会话，记忆永远排在门外。
+    private func mergedHits(_ cleaned: String, options: SearchOptions) throws -> [SearchHit] {
+        // 记忆总量很少（本机二十几份文档），先给一半名额就够它露头，
+        // 另一半留给会话，不至于搜一个词就全是汇编。
+        let memoryCap = max(1, options.limit / 2)
+        let memory = try memoryHits(cleaned, options: options, limit: memoryCap)
+        let threadBudget = max(0, options.limit - memory.count)
+        var threadOptions = options
+        threadOptions.limit = threadBudget
+        let threads = threadBudget > 0 ? try threadHits(cleaned, options: threadOptions) : []
+
+        // 会话不够填的时候，把空出来的名额还给记忆。
+        var memoryHits = memory
+        let spare = options.limit - threads.count - memory.count
+        if spare > 0, memory.count >= memoryCap {
+            memoryHits = try self.memoryHits(cleaned, options: options, limit: memoryCap + spare)
+        }
+        // 记忆排前面：库里二十几份文档对二十二万条记录，命中本身就说明这条更该先看。
+        return memoryHits + threads
+    }
+
+    /// 会话条目通道：短语优先，不足时放宽。
+    private func threadHits(_ cleaned: String, options: SearchOptions) throws -> [SearchHit] {
         let phrase = TextTools.makePhraseQuery(cleaned)
         let loose = TextTools.makeLooseQuery(cleaned)
 
