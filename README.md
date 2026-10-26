@@ -101,6 +101,12 @@ AgentHistory digest --days 7 --api https://api.openai.com/v1 gpt-4o-mini   # 改
 AgentHistory models                        # 看本机探测到哪些模型命令行、密钥环境变量是否设置
 AgentHistory digest-clean                  # 清掉汇编留下的临时会话和空项目目录
 AgentHistory mcp                          # 以 stdio MCP 服务运行
+AgentHistory mcp-status                   # 六个客户端谁接上了、握手拿不拿得到工具
+AgentHistory mcp-status --json            # 同上，给脚本解析
+AgentHistory mcp-connect claude           # 接入某个客户端，--dry-run 只看改动
+AgentHistory mcp-disconnect claude        # 移除本服务的登记
+AgentHistory mcp-repair                   # 应用挪了位置，把失效路径一次改回来
+AgentHistory mcp-snippet codex            # 打出可粘贴的配置片段
 ```
 
 `search` 是会话级聚合：同一内容族的多份副本只返回代表会话，结果里标注族内命中数和「另有 N 处副本」。短语命中排在前，单字宽命中补在后。检索命中后用 `items <会话ID> @序号` 能直接跳到那条记录，不用从头翻页。
@@ -153,6 +159,18 @@ Kimi Code 也支持 MCP。把 `{"mcpServers": {"agent-history": {"command": "…
 
 DeepSeek Harness 也有 MCP 客户端，但只能通过插件安装。仓库里的 `dsh-plugin` 是一个本地插件包，把它安装到 Harness 后会在对话里注册 `search_threads` 等工具。已经装好的副本在 `~/.agent-history/dsh-plugin`，profile 里登记为 `@local/agent-history-mcp`。
 
+### 接入面板
+
+工具栏点「MCP 接入」，六个客户端一行一个：谁已接入、谁没配、谁装了但没接、谁配了却连不上。判断不只看配置文件里有没有这一条，而是真的拉起一次 `AgentHistory mcp`，发 `initialize` 和 `tools/list`，握手通过才算已接入，同时显示拿回来几个工具。配置文件里写着、可执行文件却已经不在了，会单独标成路径失效并给「修好路径」，不会显示成已接入。
+
+每行的「接入」「移除」都先弹差异预览，红色是要删的行、绿色是要加的行；这一步只预览，取消后原文件一个字节都不动，也不留备份。确认之后先备份到 `~/.agent-history/backups/`，再只改本服务这一条登记，同一个文件里别的服务配置逐字节保持原样。WorkBuddy 那份 `mcp.json` 有近百条别的登记，动错一条就会连带坏掉一片。
+
+Claude Code 和 OpenCode 有官方登记命令，走 `claude mcp add/remove` 和 `opencode mcp add`，不直接碰它们的配置文件；命令返回非零就把退出码和输出原样报出来，也不会偷偷改成手改文件。DeepSeek Harness 只能装插件，标成插件式并单独说插件装没装。
+
+未接入是常态，启动和同步都不弹窗。只有「已经接上了、这次握手却失败」才在菜单栏多一行橙色提示，修好之后自己消失。菜单栏平时写「MCP 6/6 个客户端能调用本服务」，扫一眼就知道有没有掉线。
+
+命令行也能查：`mcp-status` 逐行报状态，全可用时退出码 0；`mcp-connect` 和 `mcp-disconnect` 对应面板上的两个动作，`mcp-repair` 修失效路径，`mcp-snippet` 打出片段。写文件之前都支持 `--dry-run`。
+
 ## 从源码打开和构建
 
 工程根目录有 `Package.swift`，可以直接用 Xcode 打开：
@@ -186,6 +204,9 @@ bash scripts/build.sh
 - `Sources/Core/Digest.swift`：主题汇编的取数、分段、模型调用与降级
 - `Sources/Core/LLM.swift`：提炼通路的探测、接口调用与命令调用
 - `Sources/UI/DigestView.swift`：主题汇编面板
+- `Sources/Core/Onboarding.swift`：六个客户端的登记位置、握手检查与状态判定
+- `Sources/Core/OnboardingWriter.swift`：只改本服务一条的 JSON 与 TOML 写入、备份和回滚
+- `Sources/UI/MCPOnboardingView.swift`：接入面板、差异预览与片段弹窗
 
 ## 常见问题
 
@@ -202,6 +223,13 @@ bash scripts/build.sh
 **同步到 Claude Code 后找不到会话。** 这条路径是实验性的。Claude Code 的会话列表由它自己维护，外部写的 JSONL 不保证被识别。失败时改用 MCP 直读或交接包。
 
 ## 验证记录
+
+2026-10-26 MCP 接入面板。以前接 MCP 要挨个翻文档改配置文件，六个客户端六个位置、三种写法，Claude Code 还有顶层和按项目两层登记，配错了只有等 agent 调不通才发现，而那已经是另一个会话里的事了。现在工具栏「MCP 接入」一屏看完：本机六个客户端 6/6 可用，五行握手各拿到 6 个工具，DeepSeek Harness 显示插件已装。`mcp-status` 同样六行、退出码 0，`--json` 的字段能被 `json.load` 直接读。
+
+写入这块花的力气最多，因为同一个文件里躺着别人家的配置。WorkBuddy 的 `mcp.json` 有 99 条别的登记，测试里 40 条旁证逐字节比对，接入再移除后和原文完全一致；Codex 那边 TOML 的注释、别的 `[mcp_servers.*]` 段也一字不动。中途发现 `JSONSerialization` 会放过尾逗号（`{"a": 1,}` 返回 true），照旧校验等于没校验，带尾逗号做文本手术会切错位置，于是换成手写的递归下降校验，逗号后直接闭合就拒。并发也守住了：写入前后比对修改时间和大小，中间被别的工具插一手就回滚并提示重试，测试用写入钩子在备份之后、落盘之前精确插一刀，确认没覆盖别人写的内容、也没丢备份。顺带修了测试自身的毛病：早先只隔离 `ONBOARD_HOME`，假备份其实写进了真实的 `~/.agent-history/backups/`，现在两个环境变量都隔离。
+
+界面在真机上过了一遍：六行状态、差异预览的增删标色、片段弹窗都正常；对 WorkBuddy 点「移除」看到整段红色删除预览后取消，配置文件 SHA 不变，备份目录也没多出东西。`bash scripts/build.sh` 352 项通过、0 失败。
+
 
 2026-10-26 备份目录自动收拾，会话列表能翻到底。`~/.agent-history/backups` 只增不减，本机涨到 811 MB，比 388 MB 的口袋库还大，每一份都是传输前 VACUUM 出来的整库副本。现在 `AgentHistory backups` 报份数、体积，并把「能自动清的时间戳目录」和「手写的断点目录」分开数；`backups prune 5` 按修改时间只留最近 5 份自动备份，`pre-digest-clean` 这类手工断点永远不碰；每次传输开始前也自动收一遍，不再等用户想起来。真实库上 `backups` 报 7 份 811.4 MB，其中 2 份是手工断点、5 份是自动备份，`prune 5` 判定无需清理。另一件是会话列表原来写死 `limit: 500`，真实库去重后 759 个会话，后 259 个在界面上永远看不见也没有提示。现在每页 200 个，滚到底出现「加载更多（已显示 N / 总数）」，按 `updated_at` 加 id 的游标续取；只按时间戳不行，真实库 2,329 个会话里有 15 对 `updated_at` 完全相同，落在页边界就会漏或重。450 个会话（含 4 对同时间戳）三页走完，一个不漏、不重复。`bash scripts/build.sh` 235 项通过、0 失败。
 

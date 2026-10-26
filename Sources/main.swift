@@ -7,6 +7,15 @@ func makeStore() throws -> Store {
     try Store()
 }
 
+/// 状态里带的登记位置，JSON 输出用。
+func registrationLocation(_ state: MCPClientState) -> String {
+    switch state {
+    case let .connected(_, _, location, _): return location
+    case let .pluginInstalled(_, location): return location
+    default: return ""
+    }
+}
+
 func fmtBytes(_ bytes: Int64) -> String {
     ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
 }
@@ -163,6 +172,154 @@ case "export":
 
 case "mcp":
     runMCP()
+
+case "mcp-status":
+    // 默认只列一行一句话；--json 给脚本用。
+    var asJSON = false
+    var timeout = MCPHandshake.defaultTimeout
+    var i = 1
+    while i < args.count {
+        switch args[i] {
+        case "--json": asJSON = true
+        case "--timeout":
+            i += 1
+            if i < args.count, let t = Int(args[i]), t > 0 { timeout = t }
+        default: break
+        }
+        i += 1
+    }
+    let reports = MCPOnboarding.inspectAll(timeout: timeout)
+    if asJSON {
+        let rows: [[String: Any]] = reports.map { report in
+            [
+                "client": report.target.kind.rawValue,
+                "name": report.displayName,
+                "style": report.styleLabel,
+                "state": report.state.label,
+                "ok": report.state.isUsable,
+                "failure": report.state.isFailure,
+                "fixable": report.state.isFixable,
+                "reason": report.reason,
+                "tools": report.state.toolCount,
+                "path": report.configPath,
+                "location": registrationLocation(report.state),
+            ]
+        }
+        let payload: [String: Any] = [
+            "checked_at": ISO8601DateFormatter().string(from: Date()),
+            "binary": MCPTargetRegistry.currentBinary(),
+            "all_ok": reports.allSatisfy { !$0.state.isFailure },
+            "clients": rows,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) {
+            print(String(decoding: data, as: UTF8.self))
+        }
+    } else {
+        for report in reports {
+            let mark: String
+            switch report.state {
+            case .connected: mark = "通过"
+            case .pluginInstalled: mark = "插件"
+            case .notInstalled: mark = "未装"
+            case .notConfigured: mark = "未接"
+            case .pluginMissing: mark = "未装"
+            case .connectFailed, .broken: mark = "失败"
+            }
+            print("\(mark)  \(report.displayName)（\(report.styleLabel)）")
+            print("      \(report.state.label)：\(report.reason)")
+            if report.target.style == .config || report.target.style == .command {
+                print("      登记：\(report.configPath)")
+            }
+        }
+        let failures = reports.filter { $0.state.isFailure }
+        let usable = reports.filter { $0.state.isUsable }.count
+        print("共 \(reports.count) 个客户端，\(usable) 个可用" + (failures.isEmpty ? "" : "，\(failures.count) 个需要处理"))
+        if !failures.isEmpty {
+            print("修复失效路径：AgentHistory mcp-repair")
+        }
+    }
+    exit(reports.contains(where: { $0.state.isFailure }) ? 1 : 0)
+
+case "mcp-connect", "mcp-disconnect":
+    let action: MCPOnboarder.Action = command == "mcp-connect" ? .connect : .disconnect
+    guard args.count >= 2 else {
+        print("用法：AgentHistory \(command) <客户端> [--dry-run]")
+        print("客户端：\(MCPTargetRegistry.allNames)")
+        exit(2)
+    }
+    guard let target = MCPTargetRegistry.parse(args[1]) else {
+        print("不认识 \(args[1])，可用：\(MCPTargetRegistry.allNames)")
+        exit(2)
+    }
+    let dryRun = args.contains("--dry-run")
+    do {
+        if dryRun {
+            let preview = try MCPOnboarder.preview(target, action: action)
+            print(preview.summary)
+            print("目标：\(preview.paths.joined(separator: "、"))")
+            if let line = preview.commandLine {
+                print("命令：\(line)")
+            } else {
+                print("--- 改动前 ---")
+                print(preview.before)
+                print("--- 改动后 ---")
+                print(preview.after)
+            }
+            exit(0)
+        }
+        let result = try MCPOnboarder.perform(target, action: action)
+        print(result.message)
+        if let backup = result.backupPath, !backup.isEmpty {
+            print("原文件已备份：\(backup)")
+        }
+        if target.style == .command {
+            print("命令式接入由 \(target.displayName) 自己维护配置，重开一次客户端生效")
+        } else if result.ok {
+            print("重启 \(target.displayName) 后新开的会话即可调用 search_threads")
+        }
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data(("失败：" + MCPOnboarder.describe(error) + "\n").utf8))
+        exit(1)
+    }
+
+case "mcp-repair":
+    // 应用被挪过位置之后，登记里还是旧路径。这里一次改完，再握手确认。
+    let reports = MCPOnboarding.inspectAll()
+    let items = MCPOnboarder.staleRegistrations(reports: reports)
+    guard !items.isEmpty else {
+        print("没有失效路径，不需要修")
+        for report in reports where report.state.isFailure {
+            print("  仍有问题：\(report.displayName) —— \(report.reason)")
+        }
+        exit(0)
+    }
+    print("有 \(items.count) 个登记指向了不存在的文件：")
+    for item in items {
+        print("  \(item.target.displayName)：\(item.oldBinary)")
+    }
+    let results = MCPOnboarder.repair(items: items)
+    for result in results {
+        print(result.message)
+        if let backup = result.backupPath, !backup.isEmpty { print("  备份：\(backup)") }
+    }
+    exit(results.allSatisfy(\.ok) ? 0 : 1)
+
+case "mcp-snippet":
+    let names = args.count > 1 ? [args[1]] : []
+    if names.isEmpty {
+        for target in MCPTargetRegistry.all() {
+            print("# \(target.displayName)（\(target.style.label)）")
+            print(MCPOnboarder.snippet(target))
+            print("")
+        }
+    } else {
+        guard let target = MCPTargetRegistry.parse(names[0]) else {
+            print("不认识 \(names[0])，可用：\(MCPTargetRegistry.allNames)")
+            exit(2)
+        }
+        print(MCPOnboarder.snippet(target))
+    }
 
 case "models":
     // 换一台机器先看这个：装了什么、该填什么命令，不用猜。
@@ -429,6 +586,11 @@ default:
       AgentHistory lineage    查看某会话的副本
       AgentHistory export     导出会话为 Markdown
       AgentHistory mcp        以 stdio MCP 运行
+      AgentHistory mcp-status 看六个客户端谁接上了（--json 给脚本用）
+      AgentHistory mcp-connect <客户端>    一键接入（--dry-run 先看改动）
+      AgentHistory mcp-disconnect <客户端> 移除本服务的登记
+      AgentHistory mcp-repair 把失效的路径一次改回当前程序
+      AgentHistory mcp-snippet [客户端]    生成手工粘贴用的配置片段
       AgentHistory digest     按天汇编一段时间的对话（默认接 claude -p 提炼）
                               --days 7 --source codex --project 路径 --no-llm
                               --command "claude -p --no-session-persistence" --timeout 600 --parallel 5
@@ -447,3 +609,4 @@ do {
     FileHandle.standardError.write(Data(("错误：" + ClaudeWriter.describe(error) + "\n").utf8))
     exit(1)
 }
+

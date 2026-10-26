@@ -1066,6 +1066,488 @@ do {
     failures += 1
 }
 
+print("MCP 接入：注册表")
+do {
+    let home = "/tmp/ah-registry-" + UUID().uuidString
+    let targets = MCPTargetRegistry.all(home: home)
+    check(targets.count == 6, "六个客户端都在注册表里")
+    check(Set(targets.map { $0.kind }).count == 6, "客户端类型不重复")
+    check(Set(targets.map { $0.rootPath }).count == 6, "根目录不重复")
+    check(Set(targets.map { $0.configPath }).count == 6, "登记文件不重复")
+    check(targets.map { $0.kind.rawValue } == ["codex", "claude", "workbuddy", "opencode", "kimi", "deepseek"],
+          "顺序固定，界面和命令行一致")
+    check(targets.allSatisfy { $0.rootPath.hasPrefix(home) }, "路径都挂在家目录下")
+    check(targets.allSatisfy { !$0.note.isEmpty }, "每项都写了备注")
+    check(Set(targets.map { $0.style }) == [.config, .command, .plugin], "三种接入方式都有覆盖")
+    check(MCPTargetRegistry.parse("claude", home: home)?.kind == .claude, "英文短名能认")
+    check(MCPTargetRegistry.parse("Claude Code", home: home)?.kind == .claude, "显示名能认")
+    check(MCPTargetRegistry.parse("claudecode", home: home)?.kind == .claude, "习惯叫法能认")
+    check(MCPTargetRegistry.parse("dsh", home: home)?.kind == .deepseek, "插件客户端也能按叫法认")
+    check(MCPTargetRegistry.parse("不存在的客户端", home: home) == nil, "认不出的返回空")
+}
+
+print("MCP 接入：装没装、接没接")
+do {
+    let home = NSTemporaryDirectory() + "agent-history-onboard-" + UUID().uuidString
+    try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+    let missing = MCPOnboarding.inspect(MCPTargetRegistry.target(.kimi, home: home))
+    if case let .notInstalled(path) = missing.state {
+        check(path.hasPrefix(home), "根目录不存在时报未安装")
+    } else {
+        check(false, "根目录不存在时不该报 " + missing.state.label)
+    }
+
+    // 装了但从来没配过。
+    try FileManager.default.createDirectory(atPath: home + "/.kimi-code", withIntermediateDirectories: true)
+    let unconfigured = MCPOnboarding.inspect(MCPTargetRegistry.target(.kimi, home: home))
+    if case .notConfigured = unconfigured.state {
+        check(true, "根目录在、没有登记文件时报未接入")
+    } else {
+        check(false, "没有登记文件时不该报 " + unconfigured.state.label)
+    }
+    check(!unconfigured.state.isFailure, "未接入不算故障")
+
+    // 文件里有别的东西但没有本服务。
+    try #"{"mcpServers": {"other": {"command": "/bin/echo"}}}"#
+        .write(toFile: home + "/.kimi-code/mcp.json", atomically: true, encoding: .utf8)
+    let other = MCPOnboarding.inspect(MCPTargetRegistry.target(.kimi, home: home))
+    if case .notConfigured = other.state { check(true, "登记文件里没有本服务时报未接入") }
+    else { check(false, "只有别的登记时不该报 " + other.state.label) }
+
+    // 文件坏了。
+    try "{ 这不是 JSON".write(toFile: home + "/.kimi-code/mcp.json", atomically: true, encoding: .utf8)
+    let broken = MCPOnboarding.inspect(MCPTargetRegistry.target(.kimi, home: home))
+    if case .broken = broken.state { check(true, "解析不了时报配置有问题") }
+    else { check(false, "坏文件不该报 " + broken.state.label) }
+    check(broken.state.isFailure, "坏文件算故障")
+
+    // 关键一条：登记在、路径失效，不能算已接入。
+    try #"{"mcpServers": {"agent-history": {"command": "/tmp/没有这个程序", "args": ["mcp"]}}}"#
+        .write(toFile: home + "/.kimi-code/mcp.json", atomically: true, encoding: .utf8)
+    let stale = MCPOnboarding.inspect(MCPTargetRegistry.target(.kimi, home: home))
+    if case let .connectFailed(_, binary, reason, fixable) = stale.state {
+        check(binary == "/tmp/没有这个程序", "报告的是登记里那个路径")
+        check(reason.contains("不在了"), "原因是文件不在了")
+        check(fixable, "路径失效可以一键修")
+    } else {
+        check(false, "路径失效时不该报 " + stale.state.label)
+    }
+    check(!stale.state.isUsable, "路径失效不能说成可用")
+    check(stale.state.isFailure, "路径失效算故障")
+
+    // 插件式的状态要跟配置式分开。
+    let pluginMissing = MCPOnboarding.inspect(MCPTargetRegistry.target(.deepseek, home: home))
+    if case .notInstalled = pluginMissing.state { check(true, "插件客户端没装时报未安装") }
+    else { check(false, "插件客户端不该报 " + pluginMissing.state.label) }
+    try FileManager.default.createDirectory(atPath: home + "/.dsh/profiles/desktop", withIntermediateDirectories: true)
+    try #"{"dsh": {"profile": {"bundles": []}}}"#
+        .write(toFile: home + "/.dsh/profiles/desktop/package.json", atomically: true, encoding: .utf8)
+    let pluginOff = MCPOnboarding.inspect(MCPTargetRegistry.target(.deepseek, home: home))
+    if case .pluginMissing = pluginOff.state { check(true, "bundles 里没有时报插件未装") }
+    else { check(false, "插件未装不该报 " + pluginOff.state.label) }
+    // 清单里登记了但插件实体不在，不能算装好。
+    try #"{"dsh": {"profile": {"bundles": ["@local/agent-history-mcp"]}}}"#
+        .write(toFile: home + "/.dsh/profiles/desktop/package.json", atomically: true, encoding: .utf8)
+    let pluginHalf = MCPOnboarding.inspect(MCPTargetRegistry.target(.deepseek, home: home))
+    if case .broken = pluginHalf.state { check(true, "清单有登记但实体不在时报配置有问题") }
+    else { check(false, "实体不在不该报 " + pluginHalf.state.label) }
+    // 补上实体。
+    try FileManager.default.createDirectory(atPath: home + "/.agent-history/dsh-plugin", withIntermediateDirectories: true)
+    let pluginOn = MCPOnboarding.inspect(MCPTargetRegistry.target(.deepseek, home: home))
+    if case let .pluginInstalled(_, location) = pluginOn.state {
+        check(location.contains("bundles"), "插件已装时报出登记位置")
+        check(pluginOn.state.isUsable, "装好插件就算可用")
+    } else {
+        check(false, "装了插件不该报 " + pluginOn.state.label)
+    }
+    try? FileManager.default.removeItem(atPath: home)
+}
+
+print("MCP 接入：握手失败分类")
+do {
+    let dir = NSTemporaryDirectory() + "agent-history-handshake-" + UUID().uuidString
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+    if case let .failed(failure) = MCPHandshake.probe(binary: dir + "/不存在", timeout: 2) {
+        check(failure == .missingBinary(dir + "/不存在"), "路径不存在时归类为找不到文件")
+        check(failure.isPathProblem, "找不到文件属于路径问题，可以一键修")
+    } else {
+        check(false, "不存在的路径不该握手成功")
+    }
+
+    // 有文件但没执行权限。
+    let plain = dir + "/not-exec"
+    try "hello".write(toFile: plain, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: plain)
+    if case let .failed(failure) = MCPHandshake.probe(binary: plain, timeout: 2) {
+        check(failure == .notExecutable(plain), "没有执行权限时单独归类")
+        check(failure.isPathProblem, "权限问题也能一键修")
+    } else {
+        check(false, "不可执行的文件不该握手成功")
+    }
+
+    // 能执行但立刻退出、什么都不输出。
+    let silent = dir + "/silent.sh"
+    try "#!/bin/sh\nexit 0\n".write(toFile: silent, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: silent)
+    if case let .failed(failure) = MCPHandshake.probe(binary: silent, timeout: 3) {
+        check(!failure.isPathProblem, "进程正常退出但没给清单，不算路径问题")
+        check(failure.reason.contains("工具清单") || failure.reason.contains("退出码"),
+              "能执行的程序没给清单时报清单缺失")
+    } else {
+        check(false, "立刻退出的程序不该握手成功")
+    }
+
+    // 一直挂着不回话，要靠超时收尾，不能把检查卡死。
+    let hang = dir + "/hang.sh"
+    try "#!/bin/sh\nwhile true; do sleep 1; done\n".write(toFile: hang, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hang)
+    let started = Date()
+    if case let .failed(failure) = MCPHandshake.probe(binary: hang, timeout: 2) {
+        check(failure.reason.contains("超时"), "挂住的进程报超时")
+    } else {
+        check(false, "挂住的进程不该握手成功")
+    }
+    let elapsed = Date().timeIntervalSince(started)
+    check(elapsed < 8, "超时后能及时收尾，实测 " + String(format: "%.1f", elapsed) + " 秒")
+    try? FileManager.default.removeItem(atPath: dir)
+}
+
+print("MCP 接入：JSON 只动自己那一条")
+do {
+    // 校验器本身先验一遍：JSONSerialization 放行尾逗号，文本手术不能放。
+    func rejects(_ text: String) -> Bool {
+        JSONSpan.validate([UInt8](text.utf8)) != nil
+    }
+    check(!rejects(#"{"a": 1}"#), "普通对象通过校验")
+    check(!rejects(#"{"a": [1, 2, {"b": null}], "c": true, "d": -1.5e3}"#), "嵌套结构通过校验")
+    check(!rejects("{\n  \"中文\": \"值\",\n  \"空\": {}\n}"), "中文键和多行通过校验")
+    check(rejects(#"{"a": 1,}"#), "尾逗号被拦下")
+    check(rejects(#"{"a": [1, 2,]}"#), "数组尾逗号被拦下")
+    check(rejects(#"{"a": 1"#), "缺闭合括号被拦下")
+    check(rejects(#"{"a" 1}"#), "缺冒号被拦下")
+    check(rejects(#"{} extra"#), "尾巴多内容被拦下")
+    check(rejects(#"{"a": }"#), "缺值被拦下")
+
+    let root = NSTemporaryDirectory() + "agent-history-write-" + UUID().uuidString
+    let backups = root + "/backups"
+    try FileManager.default.createDirectory(atPath: backups, withIntermediateDirectories: true)
+    let file = root + "/mcp.json"
+    // 仿 WorkBuddy 的样子：旁边还有几十条别的登记。
+    let others = (1...40).map { #""other-\#($0)": {"command": "/usr/bin/x\#($0)", "args": [], "disabled": true}"# }
+    let original = "{\n  \"mcpServers\": {\n    " + others.joined(separator: ",\n    ")
+        + "\n  },\n  \"version\": 2\n}\n"
+    try original.write(toFile: file, atomically: true, encoding: .utf8)
+
+    let backup = try MCPJSONWriter.upsert(path: file, key: "mcpServers", binary: "/bin/agent-history",
+                                          format: .jsonServers(key: "mcpServers", commandIsArray: false),
+                                          backupRoot: backups)
+    check(FileManager.default.fileExists(atPath: backup), "写入前留了备份")
+    let added = try String(contentsOfFile: file, encoding: .utf8)
+    let parsed = (try? JSONSerialization.jsonObject(with: Data(added.utf8))) as? [String: Any]
+    check(parsed != nil, "写完之后仍然是合法 JSON")
+    let servers = parsed?["mcpServers"] as? [String: Any]
+    check(servers?["agent-history"] != nil, "本服务那条加进去了")
+    check(servers?.count == 41, "其他 40 条一条不少")
+    check(parsed?["version"] as? Int == 2, "旁边的键没被动过")
+    var keptAll = true
+    for i in 1...40 {
+        let entry = servers?["other-\(i)"] as? [String: Any]
+        if entry?["command"] as? String != "/usr/bin/x\(i)" { keptAll = false }
+    }
+    check(keptAll, "40 条别的登记逐条对上")
+    // 逐字节对比：除了新插入的那一块，其余全文不变。
+    let head = "{\n  \"mcpServers\": {\n    " + others.joined(separator: ",\n    ")
+    check(added.hasPrefix(head), "前面几十条逐字节一致")
+    check(added.hasSuffix("\n  },\n  \"version\": 2\n}\n"), "尾部逐字节一致")
+
+    // 再写一次应当就地替换，不重复添加。
+    _ = try MCPJSONWriter.upsert(path: file, key: "mcpServers", binary: "/bin/agent-history-v2",
+                                 format: .jsonServers(key: "mcpServers", commandIsArray: false),
+                                 backupRoot: backups)
+    let again = try String(contentsOfFile: file, encoding: .utf8)
+    let againServers = ((try? JSONSerialization.jsonObject(with: Data(again.utf8))) as? [String: Any])?["mcpServers"] as? [String: Any]
+    check(againServers?.count == 41, "重复接入不新增第二条")
+    check((againServers?["agent-history"] as? [String: Any])?["command"] as? String == "/bin/agent-history-v2",
+          "重复接入把路径更新成新的")
+    check(again.contains("other-1"), "重复接入也没伤到别的登记")
+
+    // 移除后要回到原样。
+    _ = try MCPJSONWriter.remove(path: file, key: "mcpServers", backupRoot: backups)
+    let removed = try String(contentsOfFile: file, encoding: .utf8)
+    check((try? JSONSerialization.jsonObject(with: Data(removed.utf8))) != nil, "移除后仍是合法 JSON")
+    let afterServers = ((try? JSONSerialization.jsonObject(with: Data(removed.utf8))) as? [String: Any])?["mcpServers"] as? [String: Any]
+    check(afterServers?.count == 40, "移除后只剩原来那些")
+    check(afterServers?["agent-history"] == nil, "本服务那条没了")
+    check(removed == original, "移除后与原始文件逐字节一致")
+
+    // 空对象也要能塞进去。
+    let emptyFile = root + "/empty.json"
+    try "{\n  \"mcpServers\": {}\n}\n".write(toFile: emptyFile, atomically: true, encoding: .utf8)
+    _ = try MCPJSONWriter.upsert(path: emptyFile, key: "mcpServers", binary: "/bin/agent-history",
+                                 format: .jsonServers(key: "mcpServers", commandIsArray: false),
+                                 backupRoot: backups)
+    let emptyText = try String(contentsOfFile: emptyFile, encoding: .utf8)
+    check((try? JSONSerialization.jsonObject(with: Data(emptyText.utf8))) != nil, "空对象插入后是合法 JSON")
+    check(emptyText.contains("\"agent-history\""), "空对象里也塞进去了")
+
+    // 连 mcpServers 都没有。
+    let bareFile = root + "/bare.json"
+    try "{\n  \"theme\": \"dark\"\n}\n".write(toFile: bareFile, atomically: true, encoding: .utf8)
+    _ = try MCPJSONWriter.upsert(path: bareFile, key: "mcpServers", binary: "/bin/agent-history",
+                                 format: .jsonServers(key: "mcpServers", commandIsArray: false),
+                                 backupRoot: backups)
+    let bareText = try String(contentsOfFile: bareFile, encoding: .utf8)
+    let bareParsed = (try? JSONSerialization.jsonObject(with: Data(bareText.utf8))) as? [String: Any]
+    check(bareParsed?["theme"] as? String == "dark", "缺 mcpServers 时别的键不动")
+    check((bareParsed?["mcpServers"] as? [String: Any])?["agent-history"] != nil, "缺 mcpServers 时自动补一层")
+
+    // OpenCode 的 command 必须是数组。
+    let ocFile = root + "/opencode.json"
+    try "{\n  \"mcp\": {}\n}\n".write(toFile: ocFile, atomically: true, encoding: .utf8)
+    _ = try MCPJSONWriter.upsert(path: ocFile, key: "mcp", binary: "/bin/agent-history",
+                                 format: .jsonServers(key: "mcp", commandIsArray: true),
+                                 backupRoot: backups)
+    let ocText = try String(contentsOfFile: ocFile, encoding: .utf8)
+    let ocParsed = (try? JSONSerialization.jsonObject(with: Data(ocText.utf8))) as? [String: Any]
+    let ocEntry = (ocParsed?["mcp"] as? [String: Any])?["agent-history"] as? [String: Any]
+    check(ocEntry?["command"] as? [String] == ["/bin/agent-history", "mcp"], "OpenCode 的 command 写成数组")
+    check(ocEntry?["type"] as? String == "local", "OpenCode 的类型是 local")
+
+    // 带尾逗号的文件拒绝动刀。
+    let badFile = root + "/bad.json"
+    try "{\"a\": 1,}".write(toFile: badFile, atomically: true, encoding: .utf8)
+    var refused = false
+    do {
+        _ = try MCPJSONWriter.upsert(path: badFile, key: "mcpServers", binary: "/bin/x",
+                                     format: .jsonServers(key: "mcpServers", commandIsArray: false),
+                                     backupRoot: backups)
+    } catch { refused = true }
+    check(refused, "解析不了的 JSON 直接拒绝，不做手术")
+    check(try String(contentsOfFile: badFile, encoding: .utf8) == "{\"a\": 1,}", "被拒绝的文件一个字节没动")
+    try? FileManager.default.removeItem(atPath: root)
+}
+
+print("MCP 接入：TOML 只动自己那一段")
+do {
+    let root = NSTemporaryDirectory() + "agent-history-toml-" + UUID().uuidString
+    let backups = root + "/backups"
+    try FileManager.default.createDirectory(atPath: backups, withIntermediateDirectories: true)
+    let file = root + "/config.toml"
+    let original = [
+        "# 顶部注释",
+        "model = \"gpt-5\"",
+        "",
+        "[mcp_servers.agent-history]",
+        "command = \"/old/AgentHistory\"",
+        "args = [\"mcp\"]",
+        "",
+        "[mcp_servers.other]",
+        "command = \"/usr/bin/other\"",
+        "",
+        "[profiles.fast]",
+        "model = \"o4-mini\"",
+        "",
+    ].joined(separator: "\n")
+    try original.write(toFile: file, atomically: true, encoding: .utf8)
+
+    _ = try MCPTOMLWriter.upsert(path: file, prefix: "mcp_servers", binary: "/bin/new", backupRoot: backups)
+    let updated = try String(contentsOfFile: file, encoding: .utf8)
+    check(updated.contains("command = \"/bin/new\""), "路径被改写")
+    check(!updated.contains("/old/AgentHistory"), "旧路径没留下")
+    check(updated.contains("# 顶部注释"), "顶部注释还在")
+    check(updated.contains("[mcp_servers.other]") && updated.contains("/usr/bin/other"), "别的段没动")
+    check(updated.contains("[profiles.fast]") && updated.contains("o4-mini"), "无关段没动")
+    check(updated.components(separatedBy: "[mcp_servers.agent-history]").count == 2, "段没有重复")
+
+    _ = try MCPTOMLWriter.remove(path: file, prefix: "mcp_servers", backupRoot: backups)
+    let stripped = try String(contentsOfFile: file, encoding: .utf8)
+    check(!stripped.contains("[mcp_servers.agent-history]"), "整段被删掉")
+    check(!stripped.contains("/bin/new"), "段里的内容一起删掉")
+    check(stripped.contains("# 顶部注释"), "删段时注释不受影响")
+    check(stripped.contains("[mcp_servers.other]") && stripped.contains("[profiles.fast]"), "删段时别的段不受影响")
+
+    // 原本没有这一段时，接在末尾。
+    _ = try MCPTOMLWriter.upsert(path: file, prefix: "mcp_servers", binary: "/bin/new", backupRoot: backups)
+    let appended = try String(contentsOfFile: file, encoding: .utf8)
+    check(appended.contains("[mcp_servers.agent-history]\ncommand = \"/bin/new\""), "缺段时追加到末尾")
+    check(appended.hasPrefix("# 顶部注释"), "追加不影响开头")
+    try? FileManager.default.removeItem(atPath: root)
+}
+
+print("MCP 接入：并发改动会回滚")
+do {
+    let root = NSTemporaryDirectory() + "agent-history-race-" + UUID().uuidString
+    let backups = root + "/backups"
+    try FileManager.default.createDirectory(atPath: backups, withIntermediateDirectories: true)
+    let file = root + "/mcp.json"
+    let original = "{\n  \"mcpServers\": {}\n}\n"
+    try original.write(toFile: file, atomically: true, encoding: .utf8)
+
+    // 备份之后、落盘之前，别的工具插一手。
+    let intruded = "{\n  \"mcpServers\": {\"别人\": {\"command\": \"/bin/other\"}}\n}\n"
+    SafeFile.beforeWriteHook = {
+        try? intruded.write(toFile: file, atomically: true, encoding: .utf8)
+    }
+    var rolledBack = false
+    var message = ""
+    do {
+        _ = try MCPJSONWriter.upsert(path: file, key: "mcpServers", binary: "/bin/x",
+                                     format: .jsonServers(key: "mcpServers", commandIsArray: false),
+                                     backupRoot: backups)
+    } catch {
+        rolledBack = true
+        message = MCPOnboarder.describe(error)
+    }
+    SafeFile.beforeWriteHook = nil
+    check(rolledBack, "发现被别的工具插了一手就放弃：" + message)
+    let finalText = try String(contentsOfFile: file, encoding: .utf8)
+    check(!finalText.contains("agent-history"), "没有覆盖掉别人写的内容")
+    check(finalText.contains("别人"), "别人写的内容还在")
+    let backupDirs = (try? FileManager.default.contentsOfDirectory(atPath: backups)) ?? []
+    check(!backupDirs.isEmpty, "放弃前也留了备份")
+    try? FileManager.default.removeItem(atPath: root)
+}
+
+print("MCP 接入：预览与执行")
+do {
+    let home = NSTemporaryDirectory() + "agent-history-preview-" + UUID().uuidString
+    try FileManager.default.createDirectory(atPath: home + "/.kimi-code", withIntermediateDirectories: true)
+    let file = home + "/.kimi-code/mcp.json"
+    let original = "{\n  \"mcpServers\": {}\n}\n"
+    try original.write(toFile: file, atomically: true, encoding: .utf8)
+    let target = MCPTargetRegistry.target(.kimi, home: home)
+
+    let preview = try MCPOnboarder.preview(target, action: .connect, binary: "/bin/agent-history")
+    check(preview.before == original, "预览里带着改动前的全文")
+    check(preview.after.contains("/bin/agent-history"), "预览里能看出要写什么")
+    check((try? JSONSerialization.jsonObject(with: Data(preview.after.utf8))) != nil, "预览结果本身就是合法 JSON")
+    check(try String(contentsOfFile: file, encoding: .utf8) == original, "只看预览不改文件")
+    check(preview.paths == [file], "预览说清改哪个文件")
+
+    // 插件式不给一键接，要说清为什么。
+    var pluginRefused = false
+    do {
+        _ = try MCPOnboarder.preview(MCPTargetRegistry.target(.deepseek, home: home), action: .connect)
+    } catch {
+        pluginRefused = MCPOnboarder.describe(error).contains("插件")
+    }
+    check(pluginRefused, "插件式接入明确说清要走插件市场")
+
+    // 片段里的路径就是传进去的那份程序。
+    let snippet = MCPOnboarder.snippet(target, binary: "/bin/agent-history")
+    check(snippet.contains("/bin/agent-history"), "片段带上真实路径")
+    check(snippet.contains("mcpServers"), "片段是对应格式")
+    check(snippet.contains("\"mcp\""), "片段里参数是 mcp")
+
+    let tomlSnippet = MCPOnboarder.snippet(MCPTargetRegistry.target(.codex, home: home), binary: "/bin/ah")
+    check(tomlSnippet.hasPrefix("[mcp_servers.agent-history]"), "Codex 片段是 TOML 段")
+    let claudeSnippet = MCPOnboarder.snippet(MCPTargetRegistry.target(.claude, home: home), binary: "/bin/ah")
+    check(claudeSnippet.contains("claude mcp add"), "Claude 片段给的是官方命令")
+    try? FileManager.default.removeItem(atPath: home)
+}
+
+print("MCP 接入：失效路径能一次改回")
+do {
+    let home = NSTemporaryDirectory() + "agent-history-repair-" + UUID().uuidString
+    try FileManager.default.createDirectory(atPath: home + "/.kimi-code", withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(atPath: home + "/.codex", withIntermediateDirectories: true)
+    try #"{"mcpServers": {"agent-history": {"command": "/tmp/旧程序", "args": ["mcp"]}}}"#
+        .write(toFile: home + "/.kimi-code/mcp.json", atomically: true, encoding: .utf8)
+    try "[mcp_servers.agent-history]\ncommand = \"/tmp/旧程序\"\nargs = [\"mcp\"]\n"
+        .write(toFile: home + "/.codex/config.toml", atomically: true, encoding: .utf8)
+
+    let reports = MCPOnboarding.inspectAll(home: home, parallel: true)
+    check(reports.count == 6, "并行检查也返回六行")
+    check(reports.map { $0.target.kind.rawValue } == ["codex", "claude", "workbuddy", "opencode", "kimi", "deepseek"],
+          "并行检查仍是固定顺序")
+    let stale = MCPOnboarder.staleRegistrations(reports: reports)
+    check(stale.count == 2, "两台配置式客户端的路径都失效了")
+    check(Set(stale.map { $0.target.kind }) == [.codex, .kimi], "认出的正是这两台")
+    check(stale.allSatisfy { $0.oldBinary == "/tmp/旧程序" }, "记下了各自的旧路径")
+
+    let healthy = MCPOnboarding.inspectAll(home: NSTemporaryDirectory() + "ah-空-" + UUID().uuidString)
+    check(MCPOnboarder.staleRegistrations(reports: healthy).isEmpty, "都没装的时候没有要修的")
+    try? FileManager.default.removeItem(atPath: home)
+}
+
+print("MCP 接入：Claude 多层登记")
+do {
+    let root = NSTemporaryDirectory() + "agent-history-claude-" + UUID().uuidString
+    let backups = root + "/backups"
+    try FileManager.default.createDirectory(atPath: backups, withIntermediateDirectories: true)
+    let file = root + "/.claude.json"
+    let original = [
+        "{",
+        "  \"numStartups\": 12,",
+        "  \"mcpServers\": {",
+        "    \"square\": {\"command\": \"/bin/square\"}",
+        "  },",
+        "  \"projects\": {",
+        "    \"/tmp/a\": {",
+        "      \"mcpServers\": {},",
+        "      \"history\": []",
+        "    }",
+        "  }",
+        "}",
+    ].joined(separator: "\n")
+    try original.write(toFile: file, atomically: true, encoding: .utf8)
+
+    // 第一次接入：顶层没有，补在顶层。
+    _ = try MCPJSONWriter.upsert(path: file, key: "mcpServers", binary: "/bin/ah",
+                                 format: .claudeJSON, backupRoot: backups, replaceAll: true)
+    let text = try String(contentsOfFile: file, encoding: .utf8)
+    let parsed = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any]
+    check(parsed != nil, "Claude 配置写后仍可解析")
+    check(((parsed?["mcpServers"] as? [String: Any])?["agent-history"]) != nil, "顶层登记写进去了")
+    check(((parsed?["mcpServers"] as? [String: Any])?["square"]) != nil, "原本的 square 登记还在")
+    check(parsed?["numStartups"] as? Int == 12, "旁边的计数没动")
+    let project0 = (parsed?["projects"] as? [String: Any])?["/tmp/a"] as? [String: Any]
+    check((project0?["history"] as? [Any])?.isEmpty == true, "项目里别的键没动")
+
+    // 有人手工在两个项目层级都加过指向旧路径的登记，一次性改到新路径。
+    let withProjects = [
+        "{",
+        "  \"mcpServers\": {",
+        "    \"square\": {\"command\": \"/bin/square\"},",
+        "    \"agent-history\": {\"command\": \"/old/ah\"}",
+        "  },",
+        "  \"projects\": {",
+        "    \"/tmp/a\": {\"mcpServers\": {\"agent-history\": {\"command\": \"/old/ah\"}}},",
+        "    \"/tmp/b\": {\"mcpServers\": {\"agent-history\": {\"command\": \"/old/ah\"},",
+        "      \"other\": {\"command\": \"/bin/o\"}}}",
+        "  }",
+        "}",
+    ].joined(separator: "\n")
+    try withProjects.write(toFile: file, atomically: true, encoding: .utf8)
+    _ = try MCPJSONWriter.upsert(path: file, key: "mcpServers", binary: "/bin/new-ah",
+                                 format: .claudeJSON, backupRoot: backups, replaceAll: true)
+    let fixedText = try String(contentsOfFile: file, encoding: .utf8)
+    let fixed = (try? JSONSerialization.jsonObject(with: Data(fixedText.utf8))) as? [String: Any]
+    check(fixed != nil, "多处改写后仍是合法 JSON")
+    check(!fixedText.contains("/old/ah"), "三处旧路径全改掉了")
+    check(((fixed?["mcpServers"] as? [String: Any])?["agent-history"] as? [String: Any])?["command"] as? String == "/bin/new-ah",
+          "顶层换成新路径")
+    let projectA = (fixed?["projects"] as? [String: Any])?["/tmp/a"] as? [String: Any]
+    check(((projectA?["mcpServers"] as? [String: Any])?["agent-history"] as? [String: Any])?["command"] as? String == "/bin/new-ah",
+          "项目 a 换成新路径")
+    let projectB = (fixed?["projects"] as? [String: Any])?["/tmp/b"] as? [String: Any]
+    check(((projectB?["mcpServers"] as? [String: Any])?["agent-history"] as? [String: Any])?["command"] as? String == "/bin/new-ah",
+          "项目 b 换成新路径")
+    check(((projectB?["mcpServers"] as? [String: Any])?["other"]) != nil, "项目 b 里别的登记没动")
+    check(((fixed?["mcpServers"] as? [String: Any])?["square"]) != nil, "square 一直没动")
+
+    _ = try MCPJSONWriter.remove(path: file, key: "mcpServers", backupRoot: backups, replaceAll: true)
+    let removedText = try String(contentsOfFile: file, encoding: .utf8)
+    let removedParsed = (try? JSONSerialization.jsonObject(with: Data(removedText.utf8))) as? [String: Any]
+    check(!removedText.contains("agent-history"), "所有层级的本服务登记都删掉")
+    check(removedText.contains("square"), "移除后 square 还在")
+    check(((removedParsed?["projects"] as? [String: Any])?["/tmp/b"] as? [String: Any])?["mcpServers"] != nil,
+          "项目 b 那一层还在")
+    try? FileManager.default.removeItem(atPath: root)
+}
+
+
 print(failures == 0 ? "全部通过" : "失败 \(failures) 项")
 
 exit(failures == 0 ? 0 : 1)
