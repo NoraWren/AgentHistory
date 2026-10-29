@@ -4,6 +4,10 @@ AgentHistory collects the session history of local AI coding clients into one se
 
 把本机 Codex、Claude Code、WorkBuddy、OpenCode、Kimi Code、DeepSeek Harness 的会话历史收进一个可检索的库，把选中的会话交给另一个客户端继续用。数据只从各客户端读取，写入动作都要你在界面上按一次“开始同步”。
 
+![界面演示：敲「限流器」，会话和记忆一起出来](docs/demo.svg)
+
+上面这段是按界面实际布局画的示意动画：在搜索框敲「限流器」，中间先列出命中的会话；把范围切到「记忆」，交接包、汇编和结论跟着一起出来；点开其中一条，右边就是它的内容。画面里的项目名、会话标题、记忆结论和数字都是编的示例，和任何真实库无关。动画由脚本生成，改完重跑 `python3 docs/make_demo_svg.py` 即可。
+
 ## 双击打开
 
 应用在 `~/Applications/AgentHistory.app`，双击图标就能用。第一次打开如果系统拦了一下，右键选“打开”即可，之后正常双击。
@@ -29,7 +33,7 @@ AgentHistory collects the session history of local AI coding clients into one se
 
 | 目标 | 方式 | 需要知道的事 |
 | --- | --- | --- |
-| WorkBuddy | 原生导入 | 同步前必须先退出 WorkBuddy。会话文件写到 `~/.workbuddy/projects/<项目 slug>/`，同时登记到 `workbuddy.db` 的 `sessions` 表。同步后重新打开 WorkBuddy，侧边栏“任务”里能看到。 |
+| WorkBuddy | 原生导入 | 同步前必须先退出 WorkBuddy。会话文件写到 `~/.workbuddy/projects/<项目 slug>/`，同时登记到 `workbuddy.db` 的 `sessions` 表。同步后重新打开 WorkBuddy，侧栏分成「空间」和「任务」两类，导过去的会话按原项目目录归进「空间」，不再全堆在「任务」里。 |
 | OpenCode | 原生导入 | 调用官方 `opencode import`，导入后会查目标库确认。 |
 | Claude Code | 原生导入（实验） | 写到 `~/.claude/projects/` 下的 JSONL。能不能出现在 `claude --resume` 列表里取决于版本，第一次用完请自己确认。 |
 | Codex | 交接包 | Codex 不接受外部伪造的 rollout。这里生成 Markdown 交接包放在 `~/.agent-history/handoffs/`，并给出 `codex exec "读取 … 并接着做"` 的命令。 |
@@ -105,7 +109,7 @@ AgentHistory plan codex workbuddy         # 只看预览，不写文件
 AgentHistory transfer codex workbuddy     # 执行同步
 AgentHistory transfer codex workbuddy <会话ID>   # 只同步一条
 AgentHistory verify                       # 适配器契约检查
-AgentHistory repair-workbuddy             # 把已写入的会话补登记到 WorkBuddy 的会话表
+AgentHistory repair-workbuddy             # 补登记已写入的会话，按项目归组并合并重复行
 AgentHistory items <会话ID> [序号]         # 查看某个会话的条目
 AgentHistory rebuild-lineage              # 重建会话血缘，把同步产生的副本归进内容族
 AgentHistory lineage <会话ID>             # 查看某会话的双向血缘（原创与副本）
@@ -229,10 +233,13 @@ bash scripts/build.sh
 - `Sources/Core/Onboarding.swift`：六个客户端的登记位置、握手检查与状态判定
 - `Sources/Core/OnboardingWriter.swift`：只改本服务一条的 JSON 与 TOML 写入、备份和回滚
 - `Sources/UI/MCPOnboardingView.swift`：接入面板、差异预览与片段弹窗
+- `docs/make_demo_svg.py`：生成 README 顶部那段界面演示动画
 
 ## 常见问题
 
-**同步完了 WorkBuddy 里没看到。** 先确认同步时 WorkBuddy 是退出的。同步只写文件和数据库，WorkBuddy 在启动时读一次列表，所以写完要重新打开。重启后仍然没有，执行 `AgentHistory repair-workbuddy`，它会把已经写好的会话文件补登记到 `sessions` 表，然后再启动一次。
+**同步完了 WorkBuddy 里没看到。** 先确认同步时 WorkBuddy 是退出的。同步只写文件和数据库，WorkBuddy 在启动时读一次列表，所以写完要重新打开。会话不在第一屏就往下看「空间」，前面按原项目目录分区。重启后仍然没有，执行 `AgentHistory repair-workbuddy`，它会把已经写好的会话文件补登记到 `sessions` 表，然后再启动一次。
+
+**导过去的会话全在「任务」里，项目没分开。** 早期版本登记会话时把 `is_playground` 写死成 1，WorkBuddy 只把 0 的会话按目录归进「空间」，于是整批都算成了任务。现在写 0，新导出的会话直接落到对应项目下。以前导过的那批跑一次 `AgentHistory repair-workbuddy` 就归好组，顺带把同一会话重复登记的两行并掉，命令会报「已登记 / 按项目归组 / 合并重复」三个数。
 
 **提示先退出 WorkBuddy。** 这是故意的。WorkBuddy 运行时会对自己的数据库加锁，边跑边写容易让它覆盖掉新记录。
 
@@ -245,6 +252,10 @@ bash scripts/build.sh
 **同步到 Claude Code 后找不到会话。** 这条路径是实验性的。Claude Code 的会话列表由它自己维护，外部写的 JSONL 不保证被识别。失败时改用 MCP 直读或交接包。
 
 ## 验证记录
+
+- 2026-10-29 README 加了界面演示动画，WorkBuddy 分组修复一并记录。动画不是录屏，是 `docs/make_demo_svg.py` 按界面布局用 SVG + CSS 关键帧画出来的，14 秒一循环：搜索框逐字敲「限流器」，中间先出会话；范围切到「记忆」，交接包、汇编和结论跟着出来；点开一条，右边换成汇编详情。没有脚本和外部资源，GitHub 上直接会动，体积 38 KB。核对方式是把动画定格：`--still 5.2` 输出静态帧、`--pause 5.2` 把动画冻结在第 5.2 秒，同一时刻两种画法一致；再用 Chrome 无头截图看了 1.0、3.7、5.2、6.8、9.5 秒五处，没有重叠和错位。画面里的项目、会话标题和记忆结论一开始照本机库写，后来全换成了虚构示例，数字也改成自洽的一套：1231 的会话数拆到六个来源，项目名换成 demo-web、api-gateway 这类占位。
+
+- 2026-10-29 修复导出到 WorkBuddy 后会话全堆在「任务」里。根因是 `WorkBuddyRegistry.register` 把 `is_playground` 写死成 1，WorkBuddy 只把 `0` 且工作目录是绝对路径的会话归进「空间」。现在写 0；登记改成碰主键时只在未软删的行上更新，重复行软删合并，`repair-workbuddy` 会报「已登记 / 按项目归组 / 合并重复」三行汇总。本机库 817 条会话全部 `is_playground=0`，重开 WorkBuddy 后侧栏是「空间(300)」和「任务(3)」，剩下 3 条是本来就没有项目目录的老会话。`bash scripts/build.sh` 402 项测试全过、0 失败。
 
 - 2026-10-26 应用图标最终与界面统一。侧栏左上角本来就是「Theme.accent 渐变圆角方块 + 白色 brain.head.profile 符号」，界面和 Dock 两个记忆点理应一致，所以图标改成同一副：4096 画布上先画和侧栏一致的 45 度渐变底，再用 AppKit 渲染同一个 SF Symbol 白色符号缩放到 62% 居中，缩到 1024 后打包 icns。`make_icon.py` 之外新增 `make_icon.swift` 作为符号渲染一环，整套仍可一键重生成。235 项测试全过、0 失败。
 
