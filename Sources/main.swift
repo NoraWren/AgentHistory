@@ -582,8 +582,8 @@ case "verify":
 
 case "repair-workbuddy":
     let store = try makeStore()
-    let n = try WorkBuddyRegistry.backfill(store: store)
-    print("已把 \(n) 条已写入的会话登记到 WorkBuddy 的会话表")
+    let repaired = try WorkBuddyRegistry.backfill(store: store)
+    print("已登记 \(repaired.registered) 条，按项目归组 \(repaired.grouped) 条，合并重复 \(repaired.folded) 条")
     print("启动 WorkBuddy 后按项目查看；若仍未出现，先退出再重启一次")
 
 case "items":
@@ -634,6 +634,7 @@ default:
       AgentHistory models     看本机探测到哪些模型命令行，以及各自该用什么参数
       AgentHistory digest-clean  清掉汇编调用模型时留下的临时会话和空的项目目录
       AgentHistory backups    看传输前备份占了多少（prune [份数] 只留最近几份）
+      AgentHistory repair-workbuddy  修复已导出到 WorkBuddy 的会话分组（先退出 WorkBuddy）
     """)
 }
 }
