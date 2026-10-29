@@ -450,9 +450,7 @@ struct WorkBuddyWriter {
 
     func write(plan: TransferPlan, payloads: [(String, String, [ItemRow])],
                progress: @escaping (Double, String) -> Void) throws -> TransferResult {
-        if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.tencent.workbuddy.mac").isEmpty {
-            throw TransferError.message("请先退出 WorkBuddy，再执行同步")
-        }
+        if WorkBuddyRegistry.isRunning { throw TransferError.message("请先退出 WorkBuddy，再执行同步") }
         var written = 0, skipped = 0
         var artifacts: [String] = []
         for (i, entry) in payloads.enumerated() {
@@ -520,10 +518,22 @@ struct WorkBuddyWriter {
 }
 
 enum WorkBuddyRegistry {
-    static var dbPath: String { NSHomeDirectory() + "/.workbuddy/workbuddy.db" }
+    static var dbPath: String {
+        ProcessInfo.processInfo.environment["AGENT_HISTORY_WORKBUDDY_DB"]
+            ?? NSHomeDirectory() + "/.workbuddy/workbuddy.db"
+    }
 
-    static func register(file: String, store: Store) throws {
-        guard FileManager.default.fileExists(atPath: dbPath) else { return }
+    /// WorkBuddy 侧栏的分组规则：只有 `is_playground=0` 且 cwd 是绝对路径的会话才按目录
+    /// 归进「工作空间」，`is_playground=1` 一律算「任务」。以前这里写死 1，
+    /// 导过去的会话就全堆在任务里，Codex 的项目分不出来。
+    static let playground = 0
+
+    private static let pluginContextJSON = "{\"version\":1,\"selectedPluginIds\":[],\"microSceneIds\":[],\"projectResources\":{\"connectorSkillIds\":[],\"mcpServerNames\":[],\"projectSkillNames\":[]},\"pluginSettings\":{\"enabledPlugins\":{},\"extraKnownMarketplaces\":{}}}"
+
+    /// 返回顺手收掉的重复行数。
+    @discardableResult
+    static func register(file: String, store: Store, db shared: Database? = nil) throws -> Int {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return 0 }
         let sid = ((file as NSString).lastPathComponent as NSString).deletingPathExtension
         var title = "从其他客户端同步的会话"
         var cwd = ""
@@ -543,37 +553,133 @@ enum WorkBuddyRegistry {
                 }
             }
         }
-        guard !cwd.isEmpty else { return }
-        let db = try Database(path: dbPath)
+        guard !cwd.isEmpty else { return 0 }
+        let db = try shared ?? Database(path: dbPath)
         let userID = try db.query("SELECT user_id FROM sessions LIMIT 1") { $0.text(0) }.first
             ?? (try? String(contentsOfFile: NSHomeDirectory() + "/.workbuddy/device-id", encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !userID.isEmpty else { return }
+        guard !userID.isEmpty else { return 0 }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let created = minTs == .max ? now : minTs
         let updated = maxTs == 0 ? now : maxTs
         try db.run("""
-        INSERT OR REPLACE INTO sessions(id,cwd,user_id,title,status,created_at,updated_at,last_activity_at,
+        INSERT INTO sessions(id,cwd,user_id,title,status,created_at,updated_at,last_activity_at,
             is_playground,transport,mode,model,permission_mode,unread,plugin_context_json,
             last_user_prompt_expert_selection)
-        VALUES(?,?,?,?,?,?,?,?,1,'local','craft','deepseek-v4.1-flash','bypassPermissions',0,?,?)
-        """, [sid, cwd, userID, title, "completed", created, updated, updated,
-              "{\"version\":1,\"selectedPluginIds\":[],\"microSceneIds\":[],\"projectResources\":{\"connectorSkillIds\":[],\"mcpServerNames\":[],\"projectSkillNames\":[]},\"pluginSettings\":{\"enabledPlugins\":{},\"extraKnownMarketplaces\":{}}}",
-              "{\"version\":1,\"selection\":null}"])
+        VALUES(?,?,?,?,?,?,?,?,?,'local','craft','deepseek-v4.1-flash','bypassPermissions',0,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+            cwd=excluded.cwd, title=excluded.title, is_playground=excluded.is_playground,
+            updated_at=excluded.updated_at, last_activity_at=excluded.last_activity_at
+        WHERE sessions.deleted_at IS NULL
+        """, [sid, cwd, userID, title, "completed", created, updated, updated, playground,
+              pluginContextJSON, "{\"version\":1,\"selection\":null}"])
+        return try foldLegacyDuplicates(db: db, file: file, sid: sid, cwd: cwd, title: title, created: created)
     }
 
-    static func backfill(store: Store) throws -> Int {
-        guard FileManager.default.fileExists(atPath: dbPath) else { return 0 }
+    struct RepairReport {
+        var registered = 0
+        var grouped = 0
+        var folded = 0
+    }
+
+    /// 修复已经导过去的数据：重新登记一遍，把 `is_playground` 归零，顺手并掉历史重复行。
+    static func backfill(store: Store) throws -> RepairReport {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return RepairReport() }
+        if isRunning { throw TransferError.message("请先退出 WorkBuddy，再修复登记") }
         _ = try WriteSupport.backup(path: dbPath, store: store)
         let rows = try store.db.query("""
         SELECT payload FROM handoffs WHERE target='workbuddy' AND status='transferred'
         """) { $0.text(0) }
-        var count = 0
+        let db = try Database(path: dbPath)
+        var report = RepairReport()
         for file in rows where !file.isEmpty && FileManager.default.fileExists(atPath: file) {
-            try register(file: file, store: store)
-            count += 1
+            report.folded += try register(file: file, store: store, db: db)
+            report.registered += 1
         }
-        return count
+        let live = liveSessionIds()
+        try db.transaction {
+            for id in live {
+                try db.run("""
+                UPDATE sessions SET is_playground=? WHERE id=? AND deleted_at IS NULL AND is_playground<>?
+                """, [playground, id, playground])
+                report.grouped += db.changes
+            }
+            report.folded += try foldAllDuplicates(db: db, live: live)
+        }
+        return report
+    }
+
+    /// projects 目录下有 jsonl 的会话才是我方导过去的：没有文件的会话行打不开，也没有内容。
+    static func liveSessionIds() -> Set<String> {
+        let root = WriteSupport.workbuddyProjects
+        var out = Set<String>()
+        for dir in (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? [] {
+            let path = root + "/" + dir
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? [] where name.hasSuffix(".jsonl") {
+                out.insert((name as NSString).deletingPathExtension)
+            }
+        }
+        return out
+    }
+
+    /// 只在 WorkBuddy 没开着的时候写它的库，否则界面拿着内存里的旧列表覆盖回去。
+    /// 命令行进程从 LaunchServices 拿不到别的 App，NSRunningApplication 常年是空的，只能看进程。
+    static var isRunning: Bool {
+        if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.tencent.workbuddy.mac").isEmpty {
+            return true
+        }
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        probe.arguments = ["-f", "WorkBuddy.app/Contents/MacOS"]
+        probe.standardOutput = FileHandle.nullDevice
+        probe.standardError = FileHandle.nullDevice
+        guard (try? probe.run()) != nil else { return false }
+        probe.waitUntilExit()
+        return probe.terminationStatus == 0
+    }
+
+    /// 早先的导出给同一个会话留下过两行：一行对得上 jsonl，一行只剩标题。侧栏里同一条会话
+    /// 就出现两遍。这里按 WorkBuddy 自己的删除方式（写 deleted_at 软删）把没文件的那行收掉。
+    @discardableResult
+    static func foldLegacyDuplicates(db: Database, file: String, sid: String, cwd: String,
+                                     title: String, created: Int64) throws -> Int {
+        let dir = (file as NSString).deletingLastPathComponent
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        let onDisk = Set(names.filter { $0.hasSuffix(".jsonl") }.map { ($0 as NSString).deletingPathExtension })
+        let candidates = try db.query("""
+            SELECT id FROM sessions
+            WHERE id<>? AND cwd=? AND title=? AND created_at BETWEEN ? AND ? AND deleted_at IS NULL
+            """, [sid, cwd, title, created - 2_000, created + 2_000]) { $0.text(0) }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var folded = 0
+        for id in candidates where !onDisk.contains(id) {
+            try db.run("UPDATE sessions SET deleted_at=?, updated_at=? WHERE id=?", [now, now, id])
+            folded += 1
+        }
+        return folded
+    }
+
+    /// 同一目录、同一标题、同一创建时间的会话里，只保留有 jsonl 的那行。
+    /// 整组都没有文件的说明是 WorkBuddy 自己的任务，原样留着。
+    private static func foldAllDuplicates(db: Database, live: Set<String>) throws -> Int {
+        struct Row { let id: String; let cwd: String; let title: String; let created: Int64 }
+        let rows = try db.query("""
+            SELECT id, cwd, COALESCE(title,''), created_at FROM sessions WHERE deleted_at IS NULL
+            """) { Row(id: $0.text(0), cwd: $0.text(1), title: $0.text(2), created: $0.int64(3)) }
+        var groups: [String: [Row]] = [:]
+        for row in rows {
+            groups["\(row.cwd)\u{1}\(row.title)\u{1}\(row.created)", default: []].append(row)
+        }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var folded = 0
+        for (_, group) in groups where group.count > 1 {
+            guard let keep = group.first(where: { live.contains($0.id) }) else { continue }
+            for row in group where row.id != keep.id && !live.contains(row.id) {
+                try db.run("UPDATE sessions SET deleted_at=?, updated_at=? WHERE id=?", [now, now, row.id])
+                folded += 1
+            }
+        }
+        return folded
     }
 }
 

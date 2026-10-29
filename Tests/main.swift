@@ -1744,6 +1744,67 @@ do {
 }
 
 
+print("WorkBuddy 分组")
+let wbRoot = NSTemporaryDirectory() + "agent-history-wb-\(UUID().uuidString)"
+do {
+    let projects = wbRoot + "/projects"
+    try FileManager.default.createDirectory(atPath: projects + "/tmp-demo", withIntermediateDirectories: true)
+    setenv("AGENT_HISTORY_WORKBUDDY_PROJECTS", projects, 1)
+    setenv("AGENT_HISTORY_WORKBUDDY_DB", wbRoot + "/workbuddy.db", 1)
+    let ledger = try Database(path: wbRoot + "/workbuddy.db")
+    try ledger.exec("""
+    CREATE TABLE sessions(id TEXT PRIMARY KEY, cwd TEXT NOT NULL, user_id TEXT NOT NULL,
+        title TEXT, custom_title TEXT, status TEXT NOT NULL DEFAULT 'Pending',
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_activity_at INTEGER,
+        deleted_at INTEGER, is_playground INTEGER NOT NULL DEFAULT 0, source_mode TEXT,
+        mode TEXT, model TEXT, permission_mode TEXT, unread INTEGER NOT NULL DEFAULT 0,
+        project_id TEXT, transport TEXT NOT NULL DEFAULT 'local', conversation_origin TEXT,
+        group_id TEXT, group_title TEXT, plugin_context_json TEXT,
+        last_user_prompt_expert_selection TEXT)
+    """)
+    try ledger.run("""
+    INSERT INTO sessions(id,cwd,user_id,title,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)
+    """, ["seed", "/tmp/demo", "u1", "占位", "completed", 1, 1])
+
+    // 一条导出会话：侧栏按 cwd 归进「工作空间」靠的是 is_playground=0，写 1 就全掉进「任务」。
+    let sid = UUID().uuidString.lowercased()
+    let file = projects + "/tmp-demo/" + sid + ".jsonl"
+    let lines = [
+        "{\"type\":\"ai-title\",\"aiTitle\":\"按项目分组\",\"sessionId\":\"\(sid)\",\"cwd\":\"/tmp/demo\",\"timestamp\":1700000000000}",
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"你好\"}],\"sessionId\":\"\(sid)\",\"cwd\":\"/tmp/demo\",\"timestamp\":1700000000500}",
+    ]
+    try lines.joined(separator: "\n").appending("\n").write(toFile: file, atomically: true, encoding: .utf8)
+
+    let store = try Store(root: wbRoot + "/store")
+    try WorkBuddyRegistry.register(file: file, store: store)
+    let playground = try ledger.scalarInt("SELECT is_playground FROM sessions WHERE id=?", [sid])
+    check(playground == 0, "导出会话登记成工作空间而不是任务")
+
+    // 早先的导出给同一会话留过一行只有标题、没有文件的重复行，登记时收掉。
+    try ledger.run("""
+    INSERT INTO sessions(id,cwd,user_id,title,status,created_at,updated_at,is_playground)
+    VALUES(?,?,?,?,?,?,?,1)
+    """, ["ghost", "/tmp/demo", "u1", "按项目分组", "completed", 1700000000000, 1700000000000])
+    try WorkBuddyRegistry.register(file: file, store: store)
+    let ghostDeleted = try ledger.scalarInt("SELECT count(*) FROM sessions WHERE id='ghost' AND deleted_at IS NOT NULL")
+    let ghostGone = try ledger.scalarInt("SELECT count(*) FROM sessions WHERE deleted_at IS NULL")
+    check(ghostDeleted == 1, "没有文件那行被软删")
+    check(ghostGone == 2, "侧栏只剩会话本身和占位行")
+
+    // 用户自己删掉的会话不该被重新登记拉回来。
+    try ledger.run("UPDATE sessions SET deleted_at=? WHERE id=?", [1_700_000_900_000, sid])
+    try WorkBuddyRegistry.register(file: file, store: store)
+    let resurrected = try ledger.scalarInt("SELECT count(*) FROM sessions WHERE id=? AND deleted_at IS NULL", [sid])
+    check(resurrected == 0, "已删会话不会被重新登记复活")
+
+    unsetenv("AGENT_HISTORY_WORKBUDDY_PROJECTS")
+    unsetenv("AGENT_HISTORY_WORKBUDDY_DB")
+    try? FileManager.default.removeItem(atPath: wbRoot)
+} catch {
+    print("  FAIL WorkBuddy 用例：\(error)")
+    failures += 1
+}
+
 print(failures == 0 ? "全部通过" : "失败 \(failures) 项")
 
 exit(failures == 0 ? 0 : 1)
