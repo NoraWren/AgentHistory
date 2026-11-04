@@ -175,9 +175,11 @@ Codex 的注册写在 `~/.codex/config.toml`：
 
 ```toml
 [mcp_servers.agent-history]
-command = "/Users/kongqi/Applications/AgentHistory.app/Contents/MacOS/AgentHistory"
+command = "/Users/<你的用户名>/Applications/AgentHistory.app/Contents/MacOS/AgentHistory"
 args = ["mcp"]
 ```
+
+`command` 要写绝对路径，换成自己的用户名；懒得手写可以跑 `AgentHistory mcp-snippet`，它按当前安装位置生成。
 
 WorkBuddy 的注册写在 `~/.workbuddy/connectors/default/mcp.json` 的 `mcpServers` 里，键名 `agent-history`，同样是 command 加 `["mcp"]`。改完重启客户端，新开一个会话就能用。
 
