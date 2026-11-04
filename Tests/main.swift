@@ -271,7 +271,7 @@ do {
     """
     try workspaces.write(toFile: dshHome + "/storages/workspace.json", atomically: true, encoding: .utf8)
 
-    check(DSHSupport.projectDir("/Users/kongqi/PycharmProjects/易得广场") == "--Users-kongqi-PycharmProjects-~6613~5F97~5E7F~573A--", "项目目录编码")
+    check(DSHSupport.projectDir("/Users/example/Projects/示例项目") == "--Users-example-Projects-~793A~4F8B~9879~76EE--", "项目目录编码")
 
     let store5 = try Store(root: root + "/store")
     let tid = try store5.upsertThread(ThreadInput(
@@ -1038,8 +1038,8 @@ do {
 
     // 换过库目录、用副本库跑过的，路径前缀不一样，也要认出来。
     check(LLMRunner.isScratchPath("/private/tmp/ah-digest/digests/work/2026-10-20-1"), "别处根目录下的工作目录也算临时")
-    check(LLMRunner.isScratchPath("/Users/kongqi/.agent-history/digests/work/merge"), "merge 目录算临时")
-    check(!LLMRunner.isScratchPath("/Users/kongqi/PycharmProjects/易得广场"), "真实项目目录不算临时")
+    check(LLMRunner.isScratchPath("/Users/example/.agent-history/digests/work/merge"), "merge 目录算临时")
+    check(!LLMRunner.isScratchPath("/Users/example/Projects/示例项目"), "真实项目目录不算临时")
     check(!LLMRunner.isScratchPath("/tmp/digests/workshop"), "名字相近但不是工作目录的不算")
     check(!LLMRunner.isScratchPath(""), "空路径不算临时")
 
