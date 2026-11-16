@@ -277,12 +277,9 @@ enum MCPInstaller {
             return "已在 WorkBuddy 注册 MCP 直读，重启 WorkBuddy 后新开会话即可检索"
 
         case .codex:
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: NSHomeDirectory() + "/.npm-global/bin/codex")
-            p.arguments = ["mcp", "add", "agent-history", "--", binaryPath, "mcp"]
-            p.standardOutput = Pipe(); p.standardError = Pipe()
-            try p.run(); p.waitUntilExit()
-            return p.terminationStatus == 0
+            let codex = NSHomeDirectory() + "/.npm-global/bin/codex"
+            let added = try Subprocess.capture(codex, ["mcp", "add", "agent-history", "--", binaryPath, "mcp"])
+            return added.status == 0
                 ? "已在 Codex 注册 MCP 直读，新开会话即可调用 search_threads"
                 : "注册 Codex MCP 失败，可手动执行 codex mcp add"
 
@@ -1040,19 +1037,11 @@ struct DSHWriter {
         let tmp = NSTemporaryDirectory() + "dsh-" + UUID().uuidString + ".jsonl"
         try text.data(using: .utf8)?.write(to: URL(fileURLWithPath: tmp))
         defer { try? FileManager.default.removeItem(atPath: tmp) }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: zstd)
-        process.arguments = ["-q", "-c", tmp]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
+        let output = try Subprocess.capture(zstd, ["-q", "-c", tmp])
+        guard output.status == 0 else {
             throw TransferError.message("zstd 压缩失败")
         }
-        return data
+        return output.data
     }
 }
 
@@ -1139,13 +1128,8 @@ struct OpenCodeWriter {
         guard let bin = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
             throw TransferError.message("未找到 opencode 命令")
         }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: bin)
-        p.arguments = ["import", file]
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
-        try p.run(); p.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(decoding: data, as: UTF8.self)
+        let output = try Subprocess.capture(bin, ["import", file], mergeStderr: true)
+        return String(decoding: output.data, as: UTF8.self)
     }
 }
 
@@ -1287,21 +1271,18 @@ struct ClaudeWriter {
             try? fm.copyItem(atPath: file, toPath: mirror + "/" + (file as NSString).lastPathComponent)
 
             let cwd = Self.cwd(of: file) ?? NSHomeDirectory()
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: bin)
-            p.arguments = ["--resume", sid, "--print", ""]
-            p.currentDirectoryURL = URL(fileURLWithPath: fm.fileExists(atPath: cwd) ? cwd : NSHomeDirectory())
             var env = ProcessInfo.processInfo.environment
             env["CLAUDE_CONFIG_DIR"] = sandbox
             env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:9"
             env["DISABLE_TELEMETRY"] = "1"
-            p.environment = env
-            let pipe = Pipe()
-            p.standardOutput = pipe; p.standardError = pipe
-            do { try p.run() } catch { return "无法启动 claude 命令：\(error)" }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            let out = String(decoding: data, as: UTF8.self)
+            let output: Subprocess.Output
+            do {
+                output = try Subprocess.capture(bin, ["--resume", sid, "--print", ""],
+                                                environment: env,
+                                                currentDirectory: fm.fileExists(atPath: cwd) ? cwd : NSHomeDirectory(),
+                                                mergeStderr: true)
+            } catch { return "无法启动 claude 命令：\(error)" }
+            let out = String(decoding: output.data, as: UTF8.self)
             if out.contains("No conversation found") {
                 return "claude --resume 找不到会话 \(sid.prefix(8))"
             }
@@ -1329,6 +1310,7 @@ struct ClaudeWriter {
         if let h = error as? HistoryError { return h.description }
         if let d = error as? DBError { return d.description }
         let ns = error as NSError
+        if let hint = ErrorText.fileDescriptorHint(ns) { return hint }
         if ns.domain == NSCocoaErrorDomain {
             switch ns.code {
             case NSFileWriteNoPermissionError, NSFileReadNoPermissionError, 513, 257:
