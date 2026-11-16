@@ -870,6 +870,35 @@ enum DSHSupport {
 
     static func workspacePath(_ home: String) -> String { home + "/storages/workspace.json" }
 
+    static func projCacheDir(_ home: String) -> String { home + "/storages/session_projcache/sessions" }
+
+    /// DSH 侧边栏的标题、时间、轮廓都读这个投射缓存，不是会话文件本身。
+    /// 缓存空着的会话在侧边栏一律显示「未命名」，点进去之后 DSH 才回填。
+    /// 模板优先用本机 DSH 自己写过的缓存（跟着它的版本走），没有再退回随包带的一份。
+    static func projCacheTemplate(_ home: String) -> [String: Any]? {
+        let dir = projCacheDir(home)
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        let stamped = names.filter { $0.hasSuffix(".json") }.compactMap { name -> (Date, String)? in
+            let path = dir + "/" + name
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                  let date = attrs[.modificationDate] as? Date else { return nil }
+            return (date, path)
+        }
+        var candidates = stamped.sorted { $0.0 > $1.0 }.map(\.1)
+        if let resource = Bundle.main.resourcePath {
+            candidates.append(resource + "/dsh-projcache-template.json")
+        }
+        for path in candidates {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let record = object["record"] as? [String: Any],
+                  let rows = record["rows"] as? [String: Any],
+                  rows["title"] != nil, rows["sessionListMetadata"] != nil else { continue }
+            return object
+        }
+        return nil
+    }
+
     /// Codex 每个任务在 ~/Documents/Codex/<日期>/<任务名> 里单独跑，那些目录不是用户的项目。
     /// 一个目录一个工作区会在侧边栏堆出几百个一次性条目，这类路径统一归到 ~/Documents/Codex。
     static func workspaceHome(_ path: String) -> String {
@@ -933,6 +962,7 @@ struct DSHWriter {
         var written = 0, skipped = 0
         var failed = 0
         var artifacts: [String] = []
+        let cacheTemplate = DSHSupport.projCacheTemplate(home)
         for (i, entry) in payloads.enumerated() {
             let (threadId, title, items) = entry
             if try TransferPlanner.alreadyTransferredNative(store: store, threadId: threadId) {
@@ -972,6 +1002,7 @@ struct DSHWriter {
             var seq = 0
             var firstUserSeq = 0
             var lastTime = turns.first?.at ?? Int64(Date().timeIntervalSince1970 * 1000)
+            var outline: [[String: Any]] = []
             for (ti, turn) in turns.enumerated() {
                 let n = ti + 1
                 let t = turn.at == 0 ? lastTime + 1000 : turn.at
@@ -982,6 +1013,7 @@ struct DSHWriter {
                     records.append(record)
                     seq += 1
                 }
+                let turnStartSeq = seq
                 add("turn/start", ["turn": n])
                 if n == 1 { firstUserSeq = seq }
                 add("user/message", [
@@ -1007,6 +1039,9 @@ struct DSHWriter {
                 ], surface: true)
                 add("step/end", ["turn": n, "step": 1])
                 add("turn/end", ["turn": n, "reason": ["kind": "completed"]])
+                outline.append(["turn": n, "seq": turnStartSeq,
+                                "prompt": String(turn.user.prefix(400)),
+                                "response": String(turn.assistant.prefix(400))])
             }
             let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
             records.append([
@@ -1022,6 +1057,16 @@ struct DSHWriter {
             let headerFrame = try Self.compress(zstd, lines[0] + "\n")
             let bodyFrame = try Self.compress(zstd, lines.dropFirst().joined(separator: "\n") + "\n")
             try (headerFrame + bodyFrame).write(to: URL(fileURLWithPath: dir + "/session.v4.jsonl.zstd"))
+
+            if let cacheTemplate {
+                try Self.writeProjCache(cacheTemplate, home: home, sid: sid, cwd: cwd,
+                                        title: cleanTitle.isEmpty ? "导入会话" : cleanTitle,
+                                        firstPrompt: turns.first?.user ?? "",
+                                        firstPromptSeq: firstUserSeq,
+                                        createdAt: turns.first?.at ?? lastTime,
+                                        lastTime: lastTime, lastSeq: seq,
+                                        outline: outline, turnCount: turns.count)
+            }
 
             var ids = (ws["sessionIds"] as? [String]) ?? []
             if !ids.contains(sid) { ids.insert(sid, at: 0) }
@@ -1058,6 +1103,68 @@ struct DSHWriter {
 
     private static func jsonData(_ object: Any) throws -> Data {
         try JSONSerialization.data(withJSONObject: object, options: [])
+    }
+
+    /// 顺手把投射缓存也写上：DSH 侧边栏的标题、时间、轮次轮廓都读这份缓存，
+    /// 缺了它，导入的会话要点开一次才从「未命名」变成真名字。
+    private static func writeProjCache(_ template: [String: Any], home: String, sid: String, cwd: String,
+                                       title: String, firstPrompt: String, firstPromptSeq: Int,
+                                       createdAt: Int64, lastTime: Int64, lastSeq: Int,
+                                       outline: [[String: Any]], turnCount: Int) throws {
+        var root = template
+        var record = root["record"] as? [String: Any] ?? [:]
+        var rows = record["rows"] as? [String: Any] ?? [:]
+        record["identity"] = ["formatVersion": 4, "createdAt": createdAt, "cwd": cwd,
+                              "isSeeded": false, "inheritedEventCount": 0] as [String: Any]
+        for (key, value) in rows {
+            guard var row = value as? [String: Any] else { continue }
+            row["seq"] = lastSeq
+            rows[key] = row
+        }
+        func put(_ key: String, _ value: Any) {
+            var row = rows[key] as? [String: Any] ?? ["ver": 1]
+            row["seq"] = lastSeq
+            row["val"] = value
+            rows[key] = row
+        }
+        func patchValue(_ key: String, _ change: (inout [String: Any]) -> Void) {
+            guard var row = rows[key] as? [String: Any],
+                  var value = row["val"] as? [String: Any] else { return }
+            change(&value)
+            row["val"] = value
+            row["seq"] = lastSeq
+            rows[key] = row
+        }
+        put("title", title)
+        put("titleInput", ["first": ["seq": firstPromptSeq,
+                                      "text": String(firstPrompt.prefix(2000))] as [String: Any]])
+        put("sessionListMetadata", ["blank": false, "lastPromptAt": lastTime] as [String: Any])
+        put("workingDirectory", cwd)
+        put("turnOutline", ["turns": outline, "draft": ""] as [String: Any])
+        patchValue("timeContext") { $0["lastMessageTime"] = lastTime }
+        patchValue("sessionStats") { value in
+            value["turns"] = turnCount
+            value["steps"] = turnCount
+            value["lastTurn"] = turnCount
+            value["openStep"] = NSNull()
+            value["pendingCalls"] = [String: Any]()
+        }
+        patchValue("turnBoundary") { value in
+            value["openTurnStartSeq"] = NSNull()
+            value["lastStepStartSeq"] = lastSeq
+            value["lastTurn"] = turnCount
+        }
+        patchValue("agentTeam") { value in
+            value["id"] = sid
+            value["tasks"] = [Any]()
+            value["nextTaskNumber"] = 1
+        }
+        record["rows"] = rows
+        root["record"] = record
+        let dir = DSHSupport.projCacheDir(home)
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+        try data.write(to: URL(fileURLWithPath: dir + "/" + sid + ".json"))
     }
 
     private static func compress(_ zstd: String, _ text: String) throws -> Data {
