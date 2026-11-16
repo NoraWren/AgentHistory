@@ -282,7 +282,7 @@ do {
     check(DSHSupport.workspaceHome("/Users/example/Documents/Codex/2026-10-24/10-30-1-3-1-users") == "/Users/example/Documents/Codex", "一次性任务目录归到 Codex 工作区")
     check(DSHSupport.workspaceHome("/Users/example/Documents/Codex") == "/Users/example/Documents/Codex", "Codex 根目录原样保留")
     check(DSHSupport.workspaceHome("/Users/example/Documents/Gitlab知识库") == "/Users/example/Documents/Gitlab知识库", "普通项目路径不动")
-    check(DSHSupport.workspaceHome("/Users/example/PycharmProjects/cusor/ideatech-business-view") == "/Users/example/PycharmProjects/cusor/ideatech-business-view", "带日期的普通子目录不动")
+    check(DSHSupport.workspaceHome("/Users/example/Projects/my-app") == "/Users/example/Projects/my-app", "普通子目录不动")
 
     let store5 = try Store(root: root + "/store")
     let tid = try store5.upsertThread(ThreadInput(
