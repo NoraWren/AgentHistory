@@ -36,6 +36,7 @@ cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Resources/AgentHistory.icns" "$APP/Contents/Resources/AgentHistory.icns"
 cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
 cp "$ROOT/NOTICE" "$APP/Contents/Resources/NOTICE"
+cp "$ROOT/Resources/dsh-projcache-template.json" "$APP/Contents/Resources/dsh-projcache-template.json"
 xattr -cr "$APP"
 codesign --force --sign - "$APP" >/dev/null 2>&1
 echo "完成：$APP"

@@ -3,6 +3,9 @@ import Foundation
 let args = Array(CommandLine.arguments.dropFirst())
 let command = args.first ?? "ui"
 
+// 图形应用从 launchd 拿到的描述符软限制可能只有几百，同步上千个会话不够用。
+FileDescriptorLimit.raise()
+
 func makeStore() throws -> Store {
     try Store()
 }

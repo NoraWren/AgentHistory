@@ -758,19 +758,11 @@ final class DeepSeekAdapter: HistoryAdapter {
         guard let zstd = Self.zstdPath() else {
             throw HistoryError.message("未找到 zstd 解压工具，无法读取 DeepSeek Harness 会话")
         }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: zstd)
-        process.arguments = ["-dc", file]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
+        let output = try Subprocess.capture(zstd, ["-dc", file])
+        guard output.status == 0 else {
             throw HistoryError.message("zstd 解压失败：\((file as NSString).lastPathComponent)")
         }
-        return String(decoding: data, as: UTF8.self)
+        return String(decoding: output.data, as: UTF8.self)
     }
 
     func sync(into store: Store, progress: (SyncPhase) -> Void) throws -> Int {

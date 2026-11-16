@@ -1,0 +1,281 @@
+{
+ "record": {
+  "identity": {
+   "createdAt": 0,
+   "cwd": "",
+   "formatVersion": 4,
+   "inheritedEventCount": 0,
+   "isSeeded": false
+  },
+  "rows": {
+   "agentPreset": {
+    "seq": 0,
+    "val": "standard",
+    "ver": 1
+   },
+   "agentTeam": {
+    "seq": 0,
+    "val": {
+     "id": "",
+     "inheritedEventCount": 0,
+     "nextTaskNumber": 1,
+     "tasks": []
+    },
+    "ver": 7
+   },
+   "approvalState": {
+    "seq": 0,
+    "val": {
+     "policy": "ask",
+     "turnOpen": false
+    },
+    "ver": 1
+   },
+   "contextBreakdown": {
+    "seq": 0,
+    "val": {
+     "breakdown": {
+      "messageTokens": 999,
+      "systemTokens": 0,
+      "toolsTokens": 0
+     },
+     "surfaceTokens": 999,
+     "systems": []
+    },
+    "ver": 6
+   },
+   "contextPressure": {
+    "seq": 0,
+    "val": {
+     "surfaceTokens": 999
+    },
+    "ver": 5
+   },
+   "conversationContinuation": {
+    "seq": 0,
+    "val": {
+     "admitted": false,
+     "ending": null,
+     "failedAttempt": false
+    },
+    "ver": 4
+   },
+   "goal": {
+    "seq": 0,
+    "val": {
+     "current": null,
+     "failure": null,
+     "seenGoalIds": []
+    },
+    "ver": 6
+   },
+   "harnessDevLegacyPrompt": {
+    "seq": 0,
+    "val": {
+     "source": null,
+     "web": null
+    },
+    "ver": 1
+   },
+   "imageLimits": {
+    "seq": 0,
+    "val": null,
+    "ver": 1
+   },
+   "inbox": {
+    "seq": 0,
+    "val": {
+     "next-step": [],
+     "next-turn": []
+    },
+    "ver": 1
+   },
+   "llmRetry": {
+    "seq": 0,
+    "val": {},
+    "ver": 1
+   },
+   "modelSelection": {
+    "seq": 0,
+    "val": {
+     "lastUsed": null,
+     "pending": null
+    },
+    "ver": 3
+   },
+   "permissions": {
+    "seq": 0,
+    "val": {
+     "approval": "ask",
+     "preset": "workspace-write",
+     "sandbox": "workspace-write",
+     "seeded": true
+    },
+    "ver": 2
+   },
+   "plan": {
+    "seq": 0,
+    "val": {
+     "active": false,
+     "activeAtLastHeader": null,
+     "entered": false,
+     "running": null,
+     "wanted": null
+    },
+    "ver": 4
+   },
+   "sandboxMode": {
+    "seq": 0,
+    "val": "workspace-write",
+    "ver": 1
+   },
+   "sessionListMetadata": {
+    "seq": 0,
+    "val": {
+     "blank": false,
+     "lastPromptAt": 1794793489135
+    },
+    "ver": 1
+   },
+   "sessionStats": {
+    "seq": 0,
+    "val": {
+     "decodeMs": 0,
+     "decodeTokens": 0,
+     "lastTurn": 1,
+     "llmMs": 0,
+     "openStep": null,
+     "pendingCalls": {},
+     "steps": 1,
+     "toolMs": 0,
+     "ttftMs": 0,
+     "ttftSteps": 0,
+     "turns": 1
+    },
+    "ver": 1
+   },
+   "subagent": {
+    "seq": 0,
+    "val": {},
+    "ver": 2
+   },
+   "subagentCatalog": {
+    "seq": 0,
+    "val": {
+     "inheritedEventCount": 0
+    },
+    "ver": 6
+   },
+   "subagentModelSelectionPolicy": {
+    "seq": 0,
+    "val": null,
+    "ver": 1
+   },
+   "subagentTiming": {
+    "seq": 0,
+    "val": {
+     "descriptorSeen": false,
+     "settledMs": 0
+    },
+    "ver": 3
+   },
+   "timeContext": {
+    "seq": 0,
+    "val": {
+     "browserTimeZones": [],
+     "browserTurn": 1,
+     "lastInjectionTime": null,
+     "lastMessageTime": 1794793489135,
+     "lastTurnInjectionTime": null
+    },
+    "ver": 3
+   },
+   "title": {
+    "seq": 0,
+    "val": "",
+    "ver": 1
+   },
+   "titleInput": {
+    "seq": 0,
+    "val": {
+     "first": {
+      "seq": 1,
+      "text": ""
+     }
+    },
+    "ver": 3
+   },
+   "todos": {
+    "seq": 0,
+    "val": null,
+    "ver": 2
+   },
+   "tokenMeasurement": {
+    "seq": 0,
+    "val": {
+     "anchor": {
+      "assistantTokens": 18,
+      "headerSeq": null,
+      "usage": null
+     },
+     "headerSeq": null,
+     "invalidSeq": null,
+     "stepStart": null
+    },
+    "ver": 2
+   },
+   "tokenUsage": {
+    "seq": 0,
+    "val": {
+     "last": null,
+     "totals": {
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "outputTokens": 0,
+      "uncachedInputTokens": 0
+     }
+    },
+    "ver": 2
+   },
+   "turnBoundary": {
+    "seq": 0,
+    "val": {
+     "lastStepBoundary": {
+      "kind": "end",
+      "seq": 4
+     },
+     "lastStepStartSeq": 2,
+     "lastTurn": 1,
+     "openTurnStartSeq": null
+    },
+    "ver": 2
+   },
+   "turnOutline": {
+    "seq": 0,
+    "val": {
+     "draft": "",
+     "turns": []
+    },
+    "ver": 2
+   },
+   "userQuestions": {
+    "seq": 0,
+    "val": {
+     "inheritedEventCount": 0,
+     "questions": {
+      "active": [],
+      "settled": []
+     },
+     "timed": false
+    },
+    "ver": 2
+   },
+   "workingDirectory": {
+    "seq": 0,
+    "val": "",
+    "ver": 1
+   }
+  }
+ },
+ "version": 7
+}

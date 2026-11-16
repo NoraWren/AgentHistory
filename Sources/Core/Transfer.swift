@@ -277,12 +277,9 @@ enum MCPInstaller {
             return "已在 WorkBuddy 注册 MCP 直读，重启 WorkBuddy 后新开会话即可检索"
 
         case .codex:
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: NSHomeDirectory() + "/.npm-global/bin/codex")
-            p.arguments = ["mcp", "add", "agent-history", "--", binaryPath, "mcp"]
-            p.standardOutput = Pipe(); p.standardError = Pipe()
-            try p.run(); p.waitUntilExit()
-            return p.terminationStatus == 0
+            let codex = NSHomeDirectory() + "/.npm-global/bin/codex"
+            let added = try Subprocess.capture(codex, ["mcp", "add", "agent-history", "--", binaryPath, "mcp"])
+            return added.status == 0
                 ? "已在 Codex 注册 MCP 直读，新开会话即可调用 search_threads"
                 : "注册 Codex MCP 失败，可手动执行 codex mcp add"
 
@@ -872,6 +869,52 @@ enum DSHSupport {
     }
 
     static func workspacePath(_ home: String) -> String { home + "/storages/workspace.json" }
+
+    static func projCacheDir(_ home: String) -> String { home + "/storages/session_projcache/sessions" }
+
+    /// DSH 侧边栏的标题、时间、轮廓都读这个投射缓存，不是会话文件本身。
+    /// 缓存空着的会话在侧边栏一律显示「未命名」，点进去之后 DSH 才回填。
+    /// 模板优先用本机 DSH 自己写过的缓存（跟着它的版本走），没有再退回随包带的一份。
+    static func projCacheTemplate(_ home: String) -> [String: Any]? {
+        let dir = projCacheDir(home)
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        let stamped = names.filter { $0.hasSuffix(".json") }.compactMap { name -> (Date, String)? in
+            let path = dir + "/" + name
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                  let date = attrs[.modificationDate] as? Date else { return nil }
+            return (date, path)
+        }
+        var candidates = stamped.sorted { $0.0 > $1.0 }.map(\.1)
+        if let resource = Bundle.main.resourcePath {
+            candidates.append(resource + "/dsh-projcache-template.json")
+        }
+        for path in candidates {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let record = object["record"] as? [String: Any],
+                  let rows = record["rows"] as? [String: Any],
+                  rows["title"] != nil, rows["sessionListMetadata"] != nil else { continue }
+            return object
+        }
+        return nil
+    }
+
+    /// Codex 每个任务在 ~/Documents/Codex/<日期>/<任务名> 里单独跑，那些目录不是用户的项目。
+    /// 一个目录一个工作区会在侧边栏堆出几百个一次性条目，这类路径统一归到 ~/Documents/Codex。
+    static func workspaceHome(_ path: String) -> String {
+        let parts = path.split(separator: "/")
+        for (i, part) in parts.enumerated() where part == "Codex" && i > 0 && parts[i - 1] == "Documents" {
+            guard parts.count > i + 2, isDateComponent(parts[i + 1]) else { return path }
+            return "/" + parts[0...i].joined(separator: "/")
+        }
+        return path
+    }
+
+    private static func isDateComponent(_ text: Substring) -> Bool {
+        let bits = text.split(separator: "-")
+        guard bits.count == 3, bits[0].count == 4, bits[1].count == 2, bits[2].count == 2 else { return false }
+        return bits.allSatisfy { $0.allSatisfy(\.isNumber) }
+    }
 }
 
 struct DSHWriter {
@@ -893,26 +936,33 @@ struct DSHWriter {
         guard let wsData = try? Data(contentsOf: URL(fileURLWithPath: wsPath)),
               var root = (try? JSONSerialization.jsonObject(with: wsData)) as? [String: Any],
               var tables = root["tables"] as? [String: Any],
-              var workspaces = tables["workspaces"] as? [String: Any],
-              !workspaces.isEmpty else {
+              var workspaces = tables["workspaces"] as? [String: Any] else {
             throw TransferError.message("DeepSeek Harness 还没有工作区：先在 DSH 里打开一个文件夹")
         }
+        var global = root["global"] as? [String: Any] ?? [:]
+        var wsIds = global["workspaceIds"] as? [String] ?? []
 
-        func workspaceId(for cwd: String) -> String? {
-            var best: (Int, String)?
-            for (id, value) in workspaces {
-                guard let ws = value as? [String: Any], let p = ws["path"] as? String else { continue }
-                if cwd == p || cwd.hasPrefix(p + "/") {
-                    if best == nil || p.count > best!.0 { best = (p.count, id) }
-                }
+        /// Codex 的一个项目对应 DSH 的一个工作区：路径一致就复用，没有就按项目路径新建。
+        /// 找不到就退回「随便挑一个」会把所有项目的会话挤进同一个工作区里去。
+        func workspace(for cwd: String) -> String {
+            for (id, value) in workspaces where (value as? [String: Any])?["path"] as? String == cwd {
+                return id
             }
-            if let best { return best.1 }
-            return workspaces.keys.sorted().first
+            let id = UUID().uuidString.lowercased()
+            let stamp = KimiSupport.iso(Int64(Date().timeIntervalSince1970 * 1000))
+            let name = (cwd as NSString).lastPathComponent
+            workspaces[id] = ["path": cwd,
+                              "title": name.isEmpty ? cwd : name,
+                              "sessionIds": [String](),
+                              "createdAt": stamp, "updatedAt": stamp]
+            if !wsIds.contains(id) { wsIds.append(id) }
+            return id
         }
 
         var written = 0, skipped = 0
         var failed = 0
         var artifacts: [String] = []
+        let cacheTemplate = DSHSupport.projCacheTemplate(home)
         for (i, entry) in payloads.enumerated() {
             let (threadId, title, items) = entry
             if try TransferPlanner.alreadyTransferredNative(store: store, threadId: threadId) {
@@ -931,12 +981,14 @@ struct DSHWriter {
                     pending = nil
                 }
             }
-            guard !turns.isEmpty, let wsId = workspaceId(for: thread.projectPath),
-                  let ws = workspaces[wsId] as? [String: Any],
-                  let cwd = ws["path"] as? String else {
+            let projectPath = thread.projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !turns.isEmpty, !projectPath.isEmpty else {
                 skipped += 1
                 continue
             }
+            let cwd = DSHSupport.workspaceHome(projectPath)
+            let wsId = workspace(for: cwd)
+            guard let ws = workspaces[wsId] as? [String: Any] else { skipped += 1; continue }
 
             let sid = "session-" + UUID().uuidString.lowercased()
             let dir = home + "/sessions/" + DSHSupport.projectDir(cwd) + "/" + sid
@@ -950,6 +1002,7 @@ struct DSHWriter {
             var seq = 0
             var firstUserSeq = 0
             var lastTime = turns.first?.at ?? Int64(Date().timeIntervalSince1970 * 1000)
+            var outline: [[String: Any]] = []
             for (ti, turn) in turns.enumerated() {
                 let n = ti + 1
                 let t = turn.at == 0 ? lastTime + 1000 : turn.at
@@ -960,6 +1013,7 @@ struct DSHWriter {
                     records.append(record)
                     seq += 1
                 }
+                let turnStartSeq = seq
                 add("turn/start", ["turn": n])
                 if n == 1 { firstUserSeq = seq }
                 add("user/message", [
@@ -985,6 +1039,9 @@ struct DSHWriter {
                 ], surface: true)
                 add("step/end", ["turn": n, "step": 1])
                 add("turn/end", ["turn": n, "reason": ["kind": "completed"]])
+                outline.append(["turn": n, "seq": turnStartSeq,
+                                "prompt": String(turn.user.prefix(400)),
+                                "response": String(turn.assistant.prefix(400))])
             }
             let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
             records.append([
@@ -1000,6 +1057,16 @@ struct DSHWriter {
             let headerFrame = try Self.compress(zstd, lines[0] + "\n")
             let bodyFrame = try Self.compress(zstd, lines.dropFirst().joined(separator: "\n") + "\n")
             try (headerFrame + bodyFrame).write(to: URL(fileURLWithPath: dir + "/session.v4.jsonl.zstd"))
+
+            if let cacheTemplate {
+                try Self.writeProjCache(cacheTemplate, home: home, sid: sid, cwd: cwd,
+                                        title: cleanTitle.isEmpty ? "导入会话" : cleanTitle,
+                                        firstPrompt: turns.first?.user ?? "",
+                                        firstPromptSeq: firstUserSeq,
+                                        createdAt: turns.first?.at ?? lastTime,
+                                        lastTime: lastTime, lastSeq: seq,
+                                        outline: outline, turnCount: turns.count)
+            }
 
             var ids = (ws["sessionIds"] as? [String]) ?? []
             if !ids.contains(sid) { ids.insert(sid, at: 0) }
@@ -1018,6 +1085,8 @@ struct DSHWriter {
         if written > 0 {
             tables["workspaces"] = workspaces
             root["tables"] = tables
+            global["workspaceIds"] = wsIds
+            root["global"] = global
             _ = try WriteSupport.backup(path: wsPath, store: store)
             let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: URL(fileURLWithPath: wsPath))
@@ -1036,23 +1105,77 @@ struct DSHWriter {
         try JSONSerialization.data(withJSONObject: object, options: [])
     }
 
+    /// 顺手把投射缓存也写上：DSH 侧边栏的标题、时间、轮次轮廓都读这份缓存，
+    /// 缺了它，导入的会话要点开一次才从「未命名」变成真名字。
+    private static func writeProjCache(_ template: [String: Any], home: String, sid: String, cwd: String,
+                                       title: String, firstPrompt: String, firstPromptSeq: Int,
+                                       createdAt: Int64, lastTime: Int64, lastSeq: Int,
+                                       outline: [[String: Any]], turnCount: Int) throws {
+        var root = template
+        var record = root["record"] as? [String: Any] ?? [:]
+        var rows = record["rows"] as? [String: Any] ?? [:]
+        record["identity"] = ["formatVersion": 4, "createdAt": createdAt, "cwd": cwd,
+                              "isSeeded": false, "inheritedEventCount": 0] as [String: Any]
+        for (key, value) in rows {
+            guard var row = value as? [String: Any] else { continue }
+            row["seq"] = lastSeq
+            rows[key] = row
+        }
+        func put(_ key: String, _ value: Any) {
+            var row = rows[key] as? [String: Any] ?? ["ver": 1]
+            row["seq"] = lastSeq
+            row["val"] = value
+            rows[key] = row
+        }
+        func patchValue(_ key: String, _ change: (inout [String: Any]) -> Void) {
+            guard var row = rows[key] as? [String: Any],
+                  var value = row["val"] as? [String: Any] else { return }
+            change(&value)
+            row["val"] = value
+            row["seq"] = lastSeq
+            rows[key] = row
+        }
+        put("title", title)
+        put("titleInput", ["first": ["seq": firstPromptSeq,
+                                      "text": String(firstPrompt.prefix(2000))] as [String: Any]])
+        put("sessionListMetadata", ["blank": false, "lastPromptAt": lastTime] as [String: Any])
+        put("workingDirectory", cwd)
+        put("turnOutline", ["turns": outline, "draft": ""] as [String: Any])
+        patchValue("timeContext") { $0["lastMessageTime"] = lastTime }
+        patchValue("sessionStats") { value in
+            value["turns"] = turnCount
+            value["steps"] = turnCount
+            value["lastTurn"] = turnCount
+            value["openStep"] = NSNull()
+            value["pendingCalls"] = [String: Any]()
+        }
+        patchValue("turnBoundary") { value in
+            value["openTurnStartSeq"] = NSNull()
+            value["lastStepStartSeq"] = lastSeq
+            value["lastTurn"] = turnCount
+        }
+        patchValue("agentTeam") { value in
+            value["id"] = sid
+            value["tasks"] = [Any]()
+            value["nextTaskNumber"] = 1
+        }
+        record["rows"] = rows
+        root["record"] = record
+        let dir = DSHSupport.projCacheDir(home)
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+        try data.write(to: URL(fileURLWithPath: dir + "/" + sid + ".json"))
+    }
+
     private static func compress(_ zstd: String, _ text: String) throws -> Data {
         let tmp = NSTemporaryDirectory() + "dsh-" + UUID().uuidString + ".jsonl"
         try text.data(using: .utf8)?.write(to: URL(fileURLWithPath: tmp))
         defer { try? FileManager.default.removeItem(atPath: tmp) }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: zstd)
-        process.arguments = ["-q", "-c", tmp]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
+        let output = try Subprocess.capture(zstd, ["-q", "-c", tmp])
+        guard output.status == 0 else {
             throw TransferError.message("zstd 压缩失败")
         }
-        return data
+        return output.data
     }
 }
 
@@ -1139,13 +1262,8 @@ struct OpenCodeWriter {
         guard let bin = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
             throw TransferError.message("未找到 opencode 命令")
         }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: bin)
-        p.arguments = ["import", file]
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
-        try p.run(); p.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(decoding: data, as: UTF8.self)
+        let output = try Subprocess.capture(bin, ["import", file], mergeStderr: true)
+        return String(decoding: output.data, as: UTF8.self)
     }
 }
 
@@ -1287,21 +1405,18 @@ struct ClaudeWriter {
             try? fm.copyItem(atPath: file, toPath: mirror + "/" + (file as NSString).lastPathComponent)
 
             let cwd = Self.cwd(of: file) ?? NSHomeDirectory()
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: bin)
-            p.arguments = ["--resume", sid, "--print", ""]
-            p.currentDirectoryURL = URL(fileURLWithPath: fm.fileExists(atPath: cwd) ? cwd : NSHomeDirectory())
             var env = ProcessInfo.processInfo.environment
             env["CLAUDE_CONFIG_DIR"] = sandbox
             env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:9"
             env["DISABLE_TELEMETRY"] = "1"
-            p.environment = env
-            let pipe = Pipe()
-            p.standardOutput = pipe; p.standardError = pipe
-            do { try p.run() } catch { return "无法启动 claude 命令：\(error)" }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            let out = String(decoding: data, as: UTF8.self)
+            let output: Subprocess.Output
+            do {
+                output = try Subprocess.capture(bin, ["--resume", sid, "--print", ""],
+                                                environment: env,
+                                                currentDirectory: fm.fileExists(atPath: cwd) ? cwd : NSHomeDirectory(),
+                                                mergeStderr: true)
+            } catch { return "无法启动 claude 命令：\(error)" }
+            let out = String(decoding: output.data, as: UTF8.self)
             if out.contains("No conversation found") {
                 return "claude --resume 找不到会话 \(sid.prefix(8))"
             }
@@ -1329,6 +1444,7 @@ struct ClaudeWriter {
         if let h = error as? HistoryError { return h.description }
         if let d = error as? DBError { return d.description }
         let ns = error as NSError
+        if let hint = ErrorText.fileDescriptorHint(ns) { return hint }
         if ns.domain == NSCocoaErrorDomain {
             switch ns.code {
             case NSFileWriteNoPermissionError, NSFileReadNoPermissionError, 513, 257:
