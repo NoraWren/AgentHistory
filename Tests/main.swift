@@ -271,6 +271,14 @@ do {
     """
     try workspaces.write(toFile: dshHome + "/storages/workspace.json", atomically: true, encoding: .utf8)
 
+    // DSH 侧边栏的标题读投射缓存，先埋一份模板，导入时照着它的形状写
+    let cacheDir = dshHome + "/storages/session_projcache/sessions"
+    try FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
+    let cacheTemplate = """
+    {"version":7,"record":{"identity":{},"rows":{"title":{"ver":1,"seq":0,"val":""},"titleInput":{"ver":3,"seq":0,"val":{"first":{"seq":0,"text":""}}},"sessionListMetadata":{"ver":1,"seq":0,"val":{"blank":true,"lastPromptAt":null}},"workingDirectory":{"ver":1,"seq":0,"val":""},"timeContext":{"ver":3,"seq":0,"val":{"lastMessageTime":0}},"sessionStats":{"ver":1,"seq":0,"val":{"turns":0,"steps":0,"lastTurn":0,"openStep":null,"pendingCalls":{}}},"turnOutline":{"ver":2,"seq":0,"val":{"turns":[],"draft":""}},"turnBoundary":{"ver":2,"seq":0,"val":{"openTurnStartSeq":null,"lastStepStartSeq":0,"lastTurn":0}},"agentTeam":{"ver":7,"seq":0,"val":{"id":"","tasks":[],"nextTaskNumber":1}}}}}
+    """
+    try cacheTemplate.write(toFile: cacheDir + "/session-seed.json", atomically: true, encoding: .utf8)
+
     check(DSHSupport.projectDir("/Users/kongqi/PycharmProjects/易得广场") == "--Users-kongqi-PycharmProjects-~6613~5F97~5E7F~573A--", "项目目录编码")
     check(DSHSupport.workspaceHome("/Users/kongqi/Documents/Codex/2026-10-24/10-30-1-3-1-users") == "/Users/kongqi/Documents/Codex", "一次性任务目录归到 Codex 工作区")
     check(DSHSupport.workspaceHome("/Users/kongqi/Documents/Codex") == "/Users/kongqi/Documents/Codex", "Codex 根目录原样保留")
@@ -334,6 +342,23 @@ do {
         let tables = wsRoot?["tables"] as? [String: Any]
         let ws = (tables?["workspaces"] as? [String: Any])?["ws-test"] as? [String: Any]
         check((ws?["sessionIds"] as? [String])?.contains(sid) == true, "会话登记到工作区")
+        let cachePath = dshHome + "/storages/session_projcache/sessions/" + sid + ".json"
+        let cacheRoot = (try? JSONSerialization.jsonObject(
+            with: try Data(contentsOf: URL(fileURLWithPath: cachePath)))) as? [String: Any]
+        let cacheRecord = cacheRoot?["record"] as? [String: Any]
+        let cacheRows = cacheRecord?["rows"] as? [String: Any] ?? [:]
+        check((cacheRows["title"] as? [String: Any])?["val"] as? String == "交给 DSH", "投射缓存里带标题")
+        check(((cacheRows["title"] as? [String: Any])?["seq"] as? NSNumber)?.intValue == seqs.count - 1,
+              "缓存序号跟会话末尾对齐")
+        let meta = (cacheRows["sessionListMetadata"] as? [String: Any])?["val"] as? [String: Any]
+        check(meta?["blank"] as? Bool == false, "缓存不标成空会话")
+        let outline = ((cacheRows["turnOutline"] as? [String: Any])?["val"] as? [String: Any])?["turns"] as? [[String: Any]]
+        check(outline?.count == 2, "缓存里两轮轮廓")
+        check((cacheRows["workingDirectory"] as? [String: Any])?["val"] as? String == "/tmp/dsh-demo",
+              "缓存带工作目录")
+        check((cacheRecord?["identity"] as? [String: Any])?["cwd"] as? String == "/tmp/dsh-demo",
+              "缓存身份带工作目录")
+
     }
 
     // 没有对应工作区的项目要新建一个，不能挂到别的项目名下
