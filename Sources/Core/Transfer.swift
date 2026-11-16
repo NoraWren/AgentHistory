@@ -869,6 +869,23 @@ enum DSHSupport {
     }
 
     static func workspacePath(_ home: String) -> String { home + "/storages/workspace.json" }
+
+    /// Codex 每个任务在 ~/Documents/Codex/<日期>/<任务名> 里单独跑，那些目录不是用户的项目。
+    /// 一个目录一个工作区会在侧边栏堆出几百个一次性条目，这类路径统一归到 ~/Documents/Codex。
+    static func workspaceHome(_ path: String) -> String {
+        let parts = path.split(separator: "/")
+        for (i, part) in parts.enumerated() where part == "Codex" && i > 0 && parts[i - 1] == "Documents" {
+            guard parts.count > i + 2, isDateComponent(parts[i + 1]) else { return path }
+            return "/" + parts[0...i].joined(separator: "/")
+        }
+        return path
+    }
+
+    private static func isDateComponent(_ text: Substring) -> Bool {
+        let bits = text.split(separator: "-")
+        guard bits.count == 3, bits[0].count == 4, bits[1].count == 2, bits[2].count == 2 else { return false }
+        return bits.allSatisfy { $0.allSatisfy(\.isNumber) }
+    }
 }
 
 struct DSHWriter {
@@ -890,21 +907,27 @@ struct DSHWriter {
         guard let wsData = try? Data(contentsOf: URL(fileURLWithPath: wsPath)),
               var root = (try? JSONSerialization.jsonObject(with: wsData)) as? [String: Any],
               var tables = root["tables"] as? [String: Any],
-              var workspaces = tables["workspaces"] as? [String: Any],
-              !workspaces.isEmpty else {
+              var workspaces = tables["workspaces"] as? [String: Any] else {
             throw TransferError.message("DeepSeek Harness 还没有工作区：先在 DSH 里打开一个文件夹")
         }
+        var global = root["global"] as? [String: Any] ?? [:]
+        var wsIds = global["workspaceIds"] as? [String] ?? []
 
-        func workspaceId(for cwd: String) -> String? {
-            var best: (Int, String)?
-            for (id, value) in workspaces {
-                guard let ws = value as? [String: Any], let p = ws["path"] as? String else { continue }
-                if cwd == p || cwd.hasPrefix(p + "/") {
-                    if best == nil || p.count > best!.0 { best = (p.count, id) }
-                }
+        /// Codex 的一个项目对应 DSH 的一个工作区：路径一致就复用，没有就按项目路径新建。
+        /// 找不到就退回「随便挑一个」会把所有项目的会话挤进同一个工作区里去。
+        func workspace(for cwd: String) -> String {
+            for (id, value) in workspaces where (value as? [String: Any])?["path"] as? String == cwd {
+                return id
             }
-            if let best { return best.1 }
-            return workspaces.keys.sorted().first
+            let id = UUID().uuidString.lowercased()
+            let stamp = KimiSupport.iso(Int64(Date().timeIntervalSince1970 * 1000))
+            let name = (cwd as NSString).lastPathComponent
+            workspaces[id] = ["path": cwd,
+                              "title": name.isEmpty ? cwd : name,
+                              "sessionIds": [String](),
+                              "createdAt": stamp, "updatedAt": stamp]
+            if !wsIds.contains(id) { wsIds.append(id) }
+            return id
         }
 
         var written = 0, skipped = 0
@@ -928,12 +951,14 @@ struct DSHWriter {
                     pending = nil
                 }
             }
-            guard !turns.isEmpty, let wsId = workspaceId(for: thread.projectPath),
-                  let ws = workspaces[wsId] as? [String: Any],
-                  let cwd = ws["path"] as? String else {
+            let projectPath = thread.projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !turns.isEmpty, !projectPath.isEmpty else {
                 skipped += 1
                 continue
             }
+            let cwd = DSHSupport.workspaceHome(projectPath)
+            let wsId = workspace(for: cwd)
+            guard let ws = workspaces[wsId] as? [String: Any] else { skipped += 1; continue }
 
             let sid = "session-" + UUID().uuidString.lowercased()
             let dir = home + "/sessions/" + DSHSupport.projectDir(cwd) + "/" + sid
@@ -1015,6 +1040,8 @@ struct DSHWriter {
         if written > 0 {
             tables["workspaces"] = workspaces
             root["tables"] = tables
+            global["workspaceIds"] = wsIds
+            root["global"] = global
             _ = try WriteSupport.backup(path: wsPath, store: store)
             let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: URL(fileURLWithPath: wsPath))
