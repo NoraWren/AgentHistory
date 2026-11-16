@@ -272,6 +272,10 @@ do {
     try workspaces.write(toFile: dshHome + "/storages/workspace.json", atomically: true, encoding: .utf8)
 
     check(DSHSupport.projectDir("/Users/kongqi/PycharmProjects/易得广场") == "--Users-kongqi-PycharmProjects-~6613~5F97~5E7F~573A--", "项目目录编码")
+    check(DSHSupport.workspaceHome("/Users/kongqi/Documents/Codex/2026-10-24/10-30-1-3-1-users") == "/Users/kongqi/Documents/Codex", "一次性任务目录归到 Codex 工作区")
+    check(DSHSupport.workspaceHome("/Users/kongqi/Documents/Codex") == "/Users/kongqi/Documents/Codex", "Codex 根目录原样保留")
+    check(DSHSupport.workspaceHome("/Users/kongqi/Documents/Gitlab知识库") == "/Users/kongqi/Documents/Gitlab知识库", "普通项目路径不动")
+    check(DSHSupport.workspaceHome("/Users/kongqi/PycharmProjects/cusor/ideatech-business-view") == "/Users/kongqi/PycharmProjects/cusor/ideatech-business-view", "带日期的普通子目录不动")
 
     let store5 = try Store(root: root + "/store")
     let tid = try store5.upsertThread(ThreadInput(
@@ -330,6 +334,56 @@ do {
         let tables = wsRoot?["tables"] as? [String: Any]
         let ws = (tables?["workspaces"] as? [String: Any])?["ws-test"] as? [String: Any]
         check((ws?["sessionIds"] as? [String])?.contains(sid) == true, "会话登记到工作区")
+    }
+
+    // 没有对应工作区的项目要新建一个，不能挂到别的项目名下
+    let otherTid = try store5.upsertThread(ThreadInput(
+        sourceId: "claude", nativeId: "dsh-write-other", projectPath: "/tmp/dsh-other",
+        title: "另一个项目", createdAt: 1_700_000_200_000, updatedAt: 1_700_000_300_000,
+        model: "claude", threadSource: "user", archived: false, preview: "开工"))
+    _ = try store5.upsertItems(threadId: otherTid, items: [
+        ItemInput(nativeId: "o1", ordinal: 1, itemType: "userMessage", role: "user",
+                  createdAt: 1_700_000_210_000, text: "另一个项目的第一条", rawJSON: ""),
+        ItemInput(nativeId: "o2", ordinal: 2, itemType: "agentMessage", role: "assistant",
+                  createdAt: 1_700_000_220_000, text: "收到", rawJSON: "")
+    ])
+    guard let otherThread = try store5.thread(id: otherTid) else { throw HistoryError.message("缺少会话") }
+    let otherPlan = TransferPlan(sourceKind: .claude, targetKind: .deepseek, mode: .nativeImport,
+                                 threadIDs: [otherTid], messageCount: 2, duplicateCount: 0, redactedCount: 0,
+                                 estimatedBytes: 20, targetPath: dshHome + "/sessions", notes: [])
+    let otherItems = try store5.items(threadId: otherTid)
+    let otherResult = try DSHWriter(store: store5, home: dshHome)
+        .write(plan: otherPlan, payloads: [(otherThread.id, otherThread.title, otherItems)]) { _, _ in }
+    check(otherResult.written == 1, "另一个项目写入成功")
+    let otherProject = dshHome + "/sessions/" + DSHSupport.projectDir("/tmp/dsh-other")
+    let otherDirs = (try? FileManager.default.contentsOfDirectory(atPath: otherProject)) ?? []
+    check(otherDirs.count == 1, "写入自己的项目目录")
+    let wsData2 = try Data(contentsOf: URL(fileURLWithPath: dshHome + "/storages/workspace.json"))
+    let wsRoot2 = (try? JSONSerialization.jsonObject(with: wsData2)) as? [String: Any]
+    let all2 = ((wsRoot2?["tables"] as? [String: Any])?["workspaces"] as? [String: Any]) ?? [:]
+    let created = all2.first { (($0.value as? [String: Any])?["path"] as? String) == "/tmp/dsh-other" }
+    check(created != nil, "没有就按项目路径新建工作区")
+    if let created {
+        check((created.value as? [String: Any])?["title"] as? String == "dsh-other", "工作区名字取项目目录名")
+        let ids = (created.value as? [String: Any])?["sessionIds"] as? [String]
+        check(ids?.contains(otherDirs.first ?? "") == true, "新会话登记到新工作区")
+        let listed = (wsRoot2?["global"] as? [String: Any])?["workspaceIds"] as? [String]
+        check(listed?.contains(created.key) == true, "新工作区进侧边栏")
+    }
+    if let dirName = otherDirs.first {
+        let z = Process()
+        z.executableURL = URL(fileURLWithPath: DeepSeekAdapter.zstdPath() ?? "/opt/homebrew/bin/zstd")
+        z.arguments = ["-dc", otherProject + "/" + dirName + "/session.v4.jsonl.zstd"]
+        let p = Pipe()
+        z.standardOutput = p
+        z.standardError = FileHandle.nullDevice
+        try z.run()
+        let out = p.fileHandleForReading.readDataToEndOfFile()
+        try? p.fileHandleForReading.close()
+        z.waitUntilExit()
+        let first = String(decoding: out, as: UTF8.self).split(separator: "\n").first ?? ""
+        let header = (try? JSONSerialization.jsonObject(with: Data(first.utf8))) as? [String: Any]
+        check(header?["cwd"] as? String == "/tmp/dsh-other", "会话头带自己的项目路径")
     }
     let again = try DSHWriter(store: store5, home: dshHome)
         .write(plan: plan, payloads: [(thread.id, thread.title, items)]) { _, _ in }
