@@ -923,7 +923,8 @@ struct DSHWriter {
 
     private struct Turn {
         let user: String
-        let assistant: String
+        /// 一个回合里模型可能连发多条（先报进度，最后才是完整回答），全都留着。
+        let assistants: [String]
         let at: Int64
     }
 
@@ -970,17 +971,29 @@ struct DSHWriter {
                 continue
             }
             guard let thread = try store.thread(id: threadId) else { continue }
+            // 一个用户回合里模型往往连发好几条：先报进度，最后才是完整回答。
+            // 只取第一条会把真正的答复整段丢掉，所以按轮收齐、一条一个 step 全部写进去。
             var turns: [Turn] = []
-            var pending: (String, Int64)?
+            var pendingUser: (String, Int64)?
+            var pendingReplies: [(String, Int64)] = []
+            func flushTurn() {
+                defer { pendingUser = nil; pendingReplies = [] }
+                guard let user = pendingUser, !pendingReplies.isEmpty else { return }
+                turns.append(Turn(user: user.0,
+                                  assistants: pendingReplies.map { $0.0 },
+                                  at: pendingReplies.last?.1 ?? user.1))
+            }
             for item in items {
                 guard item.itemType == "userMessage" || item.itemType == "agentMessage" else { continue }
                 if item.role == "user" {
-                    pending = (item.text, item.createdAt)
-                } else if item.role == "assistant", let user = pending {
-                    turns.append(Turn(user: user.0, assistant: item.text, at: item.createdAt))
-                    pending = nil
+                    flushTurn()
+                    pendingUser = (item.text, item.createdAt)
+                } else if item.role == "assistant", pendingUser != nil {
+                    let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !text.isEmpty { pendingReplies.append((text, item.createdAt)) }
                 }
             }
+            flushTurn()
             let projectPath = thread.projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !turns.isEmpty, !projectPath.isEmpty else {
                 skipped += 1
@@ -1020,28 +1033,31 @@ struct DSHWriter {
                     "content": [["type": "text", "text": turn.user]],
                     "source": ["kind": "user"], "role": "user", "id": UUID().uuidString.lowercased()
                 ], surface: true)
-                add("step/start", ["turn": n, "step": 1])
-                add("assistant/message", [
-                    "turn": n, "step": 1,
-                    "message": [
-                        "role": "assistant",
-                        "content": [["type": "text", "text": turn.assistant]],
-                        "source": [
-                            "kind": "model", "provider": "deepseek-account", "model": "deepseek-flash",
-                            "replayState": [
-                                "response": ["kind": "deepseek-messages", "version": 1, "model": "deepseek-flash"],
-                                "blocks": [["type": "text"]]
-                            ]
+                for (si, reply) in turn.assistants.enumerated() {
+                    let step = si + 1
+                    add("step/start", ["turn": n, "step": step])
+                    add("assistant/message", [
+                        "turn": n, "step": step,
+                        "message": [
+                            "role": "assistant",
+                            "content": [["type": "text", "text": reply]],
+                            "source": [
+                                "kind": "model", "provider": "deepseek-account", "model": "deepseek-flash",
+                                "replayState": [
+                                    "response": ["kind": "deepseek-messages", "version": 1, "model": "deepseek-flash"],
+                                    "blocks": [["type": "text"]]
+                                ]
+                            ],
+                            "id": UUID().uuidString.lowercased()
                         ],
-                        "id": UUID().uuidString.lowercased()
-                    ],
-                    "stream": []
-                ], surface: true)
-                add("step/end", ["turn": n, "step": 1])
+                        "stream": []
+                    ], surface: true)
+                    add("step/end", ["turn": n, "step": step])
+                }
                 add("turn/end", ["turn": n, "reason": ["kind": "completed"]])
                 outline.append(["turn": n, "seq": turnStartSeq,
                                 "prompt": String(turn.user.prefix(400)),
-                                "response": String(turn.assistant.prefix(400))])
+                                "response": String(turn.assistants.joined(separator: "\n").prefix(400))])
             }
             let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
             records.append([
