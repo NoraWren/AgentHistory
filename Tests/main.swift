@@ -293,15 +293,18 @@ do {
         ItemInput(nativeId: "d1", ordinal: 1, itemType: "userMessage", role: "user",
                   createdAt: 1_700_000_050_000, text: "你好，继续昨天的活", rawJSON: ""),
         ItemInput(nativeId: "d2", ordinal: 2, itemType: "agentMessage", role: "assistant",
-                  createdAt: 1_700_000_060_000, text: "收到，接着说", rawJSON: ""),
-        ItemInput(nativeId: "d3", ordinal: 3, itemType: "userMessage", role: "user",
+                  createdAt: 1_700_000_060_000, text: "我先看一下仓库里的改动", rawJSON: ""),
+        ItemInput(nativeId: "d3", ordinal: 3, itemType: "agentMessage", role: "assistant",
+                  createdAt: 1_700_000_065_000,
+                  text: "完整回答：改了三处，测试都过了，这里是结尾的一段结论。", rawJSON: ""),
+        ItemInput(nativeId: "d4", ordinal: 4, itemType: "userMessage", role: "user",
                   createdAt: 1_700_000_070_000, text: "第二条", rawJSON: ""),
-        ItemInput(nativeId: "d4", ordinal: 4, itemType: "agentMessage", role: "assistant",
+        ItemInput(nativeId: "d5", ordinal: 5, itemType: "agentMessage", role: "assistant",
                   createdAt: 1_700_000_080_000, text: "好", rawJSON: "")
     ])
     guard let thread = try store5.thread(id: tid) else { throw HistoryError.message("缺少会话") }
     let plan = TransferPlan(sourceKind: .claude, targetKind: .deepseek, mode: .nativeImport,
-                            threadIDs: [tid], messageCount: 4, duplicateCount: 0, redactedCount: 0,
+                            threadIDs: [tid], messageCount: 5, duplicateCount: 0, redactedCount: 0,
                             estimatedBytes: 40, targetPath: dshHome + "/sessions", notes: [])
     let items = try store5.items(threadId: tid)
     let result = try DSHWriter(store: store5, home: dshHome)
@@ -335,6 +338,21 @@ do {
             (o["data"] as? [String: Any])?["usage"] != nil
         }
         check(!assistantHasUsage, "助手消息不带 usage")
+
+        /// 一个回合里模型先报进度再给完整回答，导入必须两条都在，不能只剩开头那句
+        let replyTexts = objs.compactMap { o -> String? in
+            guard o["type"] as? String == "assistant/message",
+                  let data = o["data"] as? [String: Any],
+                  let msg = data["message"] as? [String: Any],
+                  let content = msg["content"] as? [[String: Any]] else { return nil }
+            return content.first?["text"] as? String
+        }
+        check(replyTexts.count == 3, "回合里的每条回答都写进去")
+        check(replyTexts.contains("完整回答：改了三处，测试都过了，这里是结尾的一段结论。"),
+              "最后那条完整回答没有丢")
+        let assistantSteps = objs.filter { ($0["type"] as? String) == "assistant/message" }
+            .compactMap { (($0["data"] as? [String: Any])?["step"] as? NSNumber)?.intValue }
+        check(assistantSteps == [1, 2, 1], "同一回合内回答按 step 递增")
 
         let wsData = try Data(contentsOf: URL(fileURLWithPath: dshHome + "/storages/workspace.json"))
         let wsRoot = (try? JSONSerialization.jsonObject(with: wsData)) as? [String: Any]
